@@ -1,5 +1,5 @@
 #include<stdio.h>
 int main(void){
-	printf("Hello");
+	printf("HELLO from TERMINATOR");
 	return 0;
 }
