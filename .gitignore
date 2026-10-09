@@ -1,3 +1,16 @@
 terminator
 *.o
 x11_hello
+/argv_basic
+/chdir_basic
+/execute_input
+/execvp_basic
+/fork_basic
+/fork_execvp
+/input_basic
+/parse_basic
+/parse_input
+/process_info
+/run_command
+/wait_status
+/waitpid_basic

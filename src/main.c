@@ -1,5 +1,6 @@
-#include<stdio.h>
-int main(void){
-	printf("HELLO from TERMINATOR");
-	return 0;
+#include "shell.h"
+int main(void)
+{
+    shell_run();
+    return 0;
 }
