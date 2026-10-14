@@ -14,3 +14,21 @@ x11_hello
 /run_command
 /wait_status
 /waitpid_basic
+# GUI executables
+/terminal_gui
+/terminal_guiback
+
+# Pipeline and system-call test executables
+/dup2_basic
+/dup2_restore
+/dynamic_memory
+/pipe_basic
+/pipe_exec
+/pipeline_generic
+/pipeline_three
+/pipeline_two
+/pipes_basic
+
+# Generated test output and data
+/dup2_output.txt
+/file.txt
