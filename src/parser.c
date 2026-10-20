@@ -4,6 +4,7 @@
 
 #include <string.h>
 #include <wordexp.h>
+#include <stddef.h>
 
 #define EXPANDED_ARG_SIZE 8192
 
@@ -165,4 +166,128 @@ int parse_command(char *command, char *args[MAX_PIPE_ARGS])
 
     args[arg_count] = NULL;
     return arg_count;
+}
+
+int parse_redirections(
+    char *command,
+    char *input_file,
+    size_t input_size,
+    char *output_file,
+    size_t output_size)
+{
+    char cleaned[8192];
+    size_t r = 0, w = 0;
+
+    input_file[0] = '\0';
+    output_file[0] = '\0';
+
+    while (command[r] != '\0') {
+        char c = command[r];
+
+        if (c == '\'' || c == '"') {
+            char quote = c;
+
+            if (w + 1 >= sizeof(cleaned))
+                return -1;
+
+            cleaned[w++] = command[r++];
+
+            while (command[r] != '\0') {
+                c = command[r++];
+
+                if (w + 1 >= sizeof(cleaned))
+                    return -1;
+
+                cleaned[w++] = c;
+
+                if (c == quote)
+                    break;
+            }
+
+            if (c != quote)
+                return -1;
+
+            continue;
+        }
+
+        if (c != '<' && c != '>') {
+            if (w + 1 >= sizeof(cleaned))
+                return -1;
+
+            cleaned[w++] = c;
+            r++;
+            continue;
+        }
+
+        char *filename = (c == '<') ? input_file : output_file;
+        size_t filename_size =
+            (c == '<') ? input_size : output_size;
+
+        if (filename[0] != '\0')
+            return -1;
+
+        r++;
+
+        while (command[r] == ' ' || command[r] == '\t')
+            r++;
+
+        if (command[r] == '\0' ||
+            command[r] == '<' || command[r] == '>')
+            return -1;
+
+        size_t f = 0;
+        char quote = '\0';
+
+        while (command[r] != '\0') {
+            c = command[r];
+
+            if (quote != '\0') {
+                if (c == quote) {
+                    quote = '\0';
+                    r++;
+                    continue;
+                }
+
+                if (f + 1 >= filename_size)
+                    return -1;
+
+                filename[f++] = c;
+                r++;
+                continue;
+            }
+
+            if (c == '\'' || c == '"') {
+                quote = c;
+                r++;
+                continue;
+            }
+
+            if (c == ' ' || c == '\t' ||
+                c == '<' || c == '>')
+                break;
+
+            if (f + 1 >= filename_size)
+                return -1;
+
+            filename[f++] = c;
+            r++;
+        }
+
+        if (quote != '\0' || f == 0)
+            return -1;
+
+        filename[f] = '\0';
+    }
+
+    cleaned[w] = '\0';
+
+    size_t start = 0;
+
+    while (cleaned[start] == ' ' || cleaned[start] == '\t')
+        start++;
+
+    memmove(command, cleaned + start,
+            strlen(cleaned + start) + 1);
+
+    return command[0] == '\0' ? -1 : 0;
 }

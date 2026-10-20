@@ -864,8 +864,18 @@ int main(void)
                     else {
                         char *args[MAX_PIPE_ARGS];
 
-                        int arg_count = parse_command(command, args);
+                        char input_file[INPUT_SIZE] = "";
+                        char output_file[INPUT_SIZE] = "";
 
+                        int redirection_status = parse_redirections(
+                            command,
+                            input_file, sizeof(input_file),
+                            output_file, sizeof(output_file)
+                        );
+
+                        int arg_count = (redirection_status == 0)
+                            ? parse_command(command, args)
+                            : -1;
                         if (arg_count < 0) {
                             append_output(
                                 &tab->output,
@@ -995,7 +1005,6 @@ int main(void)
                                                     &tab->output_capacity,
                                                     &tab->output_length
                                                 );
-
                                                 if (last_status == -1) {
                                                     last_status = 1;
                                                     append_output(&tab->output,
@@ -1181,8 +1190,10 @@ int main(void)
                                     }
                                 }
                                 else {
-                                    last_status = run_command(
+                                    last_status = run_command_redirected(
                                         args,
+                                        input_file[0] != '\0' ? input_file : NULL,
+                                        output_file[0] != '\0' ? output_file : NULL,
                                         &tab->output,
                                         &tab->output_capacity,
                                         &tab->output_length

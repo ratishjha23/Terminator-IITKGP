@@ -9,7 +9,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
-
+#include <fcntl.h>
 /* Execute one command and capture its stdout and stderr. */
 int run_command(char *args[],
                 char **output, int *output_capacity,
@@ -297,4 +297,151 @@ int run_pipeline(char *commands[][MAX_PIPE_ARGS], int command_count,
 
     return 1;
 
+}
+
+int run_command_redirected(
+    char *args[],
+    const char *input_file,
+    const char *output_file,
+    char **output,
+    int *output_capacity,
+    int *output_length
+)
+{
+    int pipefd[2];
+
+    if (pipe(pipefd) == -1) {
+        perror("pipe");
+        return -1;
+    }
+
+    pid_t pid = fork();
+
+    if (pid == -1) {
+        perror("fork");
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return -1;
+    }
+
+    if (pid == 0) {
+        close(pipefd[0]);
+
+        /* Capture stderr for display in the GUI. */
+        if (dup2(pipefd[1], STDERR_FILENO) == -1) {
+            _exit(1);
+        }
+
+        /* Handle input redirection. */
+        if (input_file != NULL) {
+            int fd = open(input_file, O_RDONLY);
+
+            if (fd == -1) {
+                perror(input_file);
+                _exit(1);
+            }
+
+            if (dup2(fd, STDIN_FILENO) == -1) {
+                perror("dup2 stdin");
+                close(fd);
+                _exit(1);
+            }
+
+            close(fd);
+        }
+
+        /* Handle output redirection OR capture stdout. */
+        if (output_file != NULL) {
+            int fd = open(
+                output_file,
+                O_WRONLY | O_CREAT | O_TRUNC,
+                0666
+            );
+
+            if (fd == -1) {
+                perror(output_file);
+                _exit(1);
+            }
+
+            if (dup2(fd, STDOUT_FILENO) == -1) {
+                perror("dup2 stdout");
+                close(fd);
+                _exit(1);
+            }
+
+            close(fd);
+        } else {
+            if (dup2(pipefd[1], STDOUT_FILENO) == -1) {
+                _exit(1);
+            }
+        }
+
+        /* IMPORTANT: close the pipe only AFTER both dup2 calls. */
+        close(pipefd[1]);
+
+        execvp(args[0], args);
+
+        perror(args[0]);
+        _exit(127);
+    }
+
+    close(pipefd[1]);
+
+    char buffer[4096];
+    ssize_t bytes_read;
+    int read_error = 0;
+
+    for (;;) {
+        bytes_read = read(pipefd[0], buffer, sizeof(buffer));
+
+        if (bytes_read > 0) {
+            char chunk[4097];
+
+            memcpy(chunk, buffer, (size_t)bytes_read);
+            chunk[bytes_read] = '\0';
+
+            if (append_output(
+                    output,
+                    output_capacity,
+                    output_length,
+                    chunk
+                ) == -1) {
+                read_error = 1;
+                break;
+            }
+        } else if (bytes_read == -1 && errno == EINTR) {
+            continue;
+        } else {
+            if (bytes_read == -1) {
+                perror("read");
+                read_error = 1;
+            }
+            break;
+        }
+    }
+
+    close(pipefd[0]);
+
+    int status;
+
+    while (waitpid(pid, &status, 0) == -1) {
+        if (errno != EINTR) {
+            perror("waitpid");
+            return -1;
+        }
+    }
+
+    if (read_error) {
+        return -1;
+    }
+
+    if (WIFEXITED(status)) {
+        return WEXITSTATUS(status);
+    }
+
+    if (WIFSIGNALED(status)) {
+        return 128 + WTERMSIG(status);
+    }
+
+    return 1;
 }
