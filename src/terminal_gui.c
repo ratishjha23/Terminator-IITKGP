@@ -12,6 +12,11 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "executor.h"
+#include "output_buffer.h"
+#include "parser.h"
+#include "history.h"
+
 #define WINDOW_WIDTH 500
 #define WINDOW_HEIGHT 300
 
@@ -21,47 +26,105 @@
 #define PROMPT_Y 280
 #define VISIBLE_LINES (((HISTORY_BOTTOM - HISTORY_TOP) / LINE_HEIGHT) + 1)
 
-#define MAX_PIPE_COMMANDS 10
-#define MAX_PIPE_ARGS 10
 #define INPUT_SIZE 100
+#define MAX_TABS 10
 
-char history[100][INPUT_SIZE];
-int history_count = 0;
-int history_position = 0;
-int scroll_offset = 0;
 
-/* Add text to the dynamically growing output buffer. */
-int append_output(char **output, int *output_capacity,
-                  int *output_length, const char *text)
+#define TAB_BAR_HEIGHT 30
+#define TAB_WIDTH 100
+
+typedef struct {
+    char input[INPUT_SIZE];
+    int length;
+    int continuing;
+
+    char pending_input[INPUT_SIZE];
+    int pending_length;
+
+    char *output;
+    int output_capacity;
+    int output_length;
+
+    int history_position;
+    int scroll_offset;
+
+    char cwd[4096];
+} Tab;
+
+Tab tabs[MAX_TABS];
+int tab_count = 0;
+int active_tab = 0;
+int last_status = 0;
+
+#define MAX_JOBS 100
+
+
+typedef struct {
+    pid_t pid;
+    pid_t pgid;
+    char command[INPUT_SIZE];
+    int running;
+    int stopped;
+} Job;
+
+
+Job jobs[MAX_JOBS];
+int job_count = 0;
+
+
+
+
+
+/* Check whether a command needs another input line. */
+int command_needs_more_input(const char *command)
 {
-    int text_length = (int)strlen(text);
+    enum { MAX_NESTING = 64 };
+    struct frame { int kind; int parens; char saved_quote; } stack[MAX_NESTING];
+    int depth = 0, escaped = 0;
+    char quote = '\0';
 
-    if (*output_length + text_length + 1 > *output_capacity) {
-        int new_capacity = *output_capacity;
+    for (int i = 0; command[i] != '\0'; i++) {
+        char c = command[i];
+        if (escaped) { escaped = 0; continue; }
+        if (c == '\\' && quote != '\'') { escaped = 1; continue; }
 
-        while (*output_length + text_length + 1 > new_capacity) {
-            if (new_capacity > 100000000 / 2) {
-                return -1;
-            }
-            new_capacity *= 2;
+        if (quote == '\'') {
+            if (c == '\'') quote = '\0';
+            continue;
+        }
+        if (quote == '"') {
+            if (c == '"') { quote = '\0'; continue; }
+        } else if (c == '"' || c == '\'') {
+            quote = c;
+            continue;
         }
 
-        char *new_output = realloc(*output, (size_t)new_capacity);
-
-        if (new_output == NULL) {
-            return -1;
+        if (depth > 0 && stack[depth - 1].kind == 2 &&
+            c == 0x60 && quote == '\0') {
+            quote = stack[--depth].saved_quote;
+            continue;
         }
-
-        *output = new_output;
-        *output_capacity = new_capacity;
+        if (c == '$' && command[i + 1] == '(') {
+            if (depth == MAX_NESTING) return 1;
+            stack[depth++] = (struct frame){1, 1, quote};
+            quote = '\0';
+            i++;
+            continue;
+        }
+        if (c == 0x60) {
+            if (depth == MAX_NESTING) return 1;
+            stack[depth++] = (struct frame){2, 0, quote};
+            quote = '\0';
+            continue;
+        }
+        if (quote == '\0' && depth > 0 &&
+            stack[depth - 1].kind == 1) {
+            if (c == '(') stack[depth - 1].parens++;
+            else if (c == ')' && --stack[depth - 1].parens == 0)
+                quote = stack[--depth].saved_quote;
+        }
     }
-
-    memcpy(*output + *output_length, text, (size_t)text_length);
-
-    *output_length += text_length;
-    (*output)[*output_length] = '\0';
-
-    return 0;
+    return quote != '\0' || depth > 0;
 }
 
 /* Count the lines currently stored in the output buffer. */
@@ -86,7 +149,6 @@ int count_output_lines(const char *output, int output_length)
     return lines;
 }
 
-
 /* Draw the visible portion of the command output. */
 void draw_output(Display *display, Window window, GC gc,
                  const char *output, int output_length)
@@ -97,29 +159,27 @@ void draw_output(Display *display, Window window, GC gc,
                          ? total_lines - VISIBLE_LINES
                          : 0;
 
-    if (scroll_offset > max_scroll) {
-        scroll_offset = max_scroll;
+    Tab *tab = &tabs[active_tab];
+
+    if (tab->scroll_offset > max_scroll) {
+        tab->scroll_offset = max_scroll;
     }
 
-    int first_line = total_lines - VISIBLE_LINES - scroll_offset;
+    int first_line = total_lines - VISIBLE_LINES
+                     - tab->scroll_offset;
 
     if (first_line < 0) {
         first_line = 0;
     }
 
-    /* Count how many lines will actually be displayed. */
     int visible_count = total_lines - first_line;
 
     if (visible_count > VISIBLE_LINES) {
         visible_count = VISIBLE_LINES;
     }
 
-    /*
-     * Short output starts near the bottom.
-     * Longer output fills the available area upward.
-     */
-    int starting_y = HISTORY_BOTTOM -
-                     (visible_count - 1) * LINE_HEIGHT;
+    int starting_y = HISTORY_BOTTOM
+                     - (visible_count - 1) * LINE_HEIGHT;
 
     int current_line = 0;
     int start = 0;
@@ -135,8 +195,8 @@ void draw_output(Display *display, Window window, GC gc,
                     XDrawString(
                         display, window, gc,
                         10,
-                        starting_y +
-                            (current_line - first_line) * LINE_HEIGHT,
+                        starting_y
+                            + (current_line - first_line) * LINE_HEIGHT,
                         output + start,
                         line_length
                     );
@@ -149,6 +209,93 @@ void draw_output(Display *display, Window window, GC gc,
     }
 }
 
+int initialize_tab(int index)
+{
+    Tab *tab = &tabs[index];
+    tab->input[0] = '\0';
+    tab->length = 0;
+
+    tab->pending_input[0] = '\0';
+    tab->pending_length = 0;
+    tab->continuing = 0;
+
+    tab->output_capacity = 4096;
+    tab->output_length = 0;
+    tab->output = malloc((size_t)tab->output_capacity);
+
+    if (tab->output == NULL) {
+        return -1;
+    }
+
+    tab->output[0] = '\0';
+
+    tab->history_position = history_count;
+    tab->scroll_offset = 0;
+
+    if (getcwd(tab->cwd, sizeof(tab->cwd)) == NULL) {
+        tab->cwd[0] = '\0';
+    }
+
+    return 0;
+}
+
+void close_tab(int index)
+{
+    if (index < 0 || index >= tab_count) {
+        return;
+    }
+
+    free(tabs[index].output);
+
+    for (int i = index; i < tab_count - 1; i++) {
+        tabs[i] = tabs[i + 1];
+    }
+
+    tab_count--;
+
+    if (tab_count == 0) {
+        tab_count = 1;
+        active_tab = 0;
+        initialize_tab(0);
+        return;
+    }
+
+    if (active_tab >= tab_count) {
+        active_tab = tab_count - 1;
+    } else if (active_tab > index) {
+        active_tab--;
+    }
+}
+
+
+
+void draw_tabs(Display *display, Window window, GC gc)
+{
+    for (int i = 0; i < tab_count; i++) {
+        int x = i * TAB_WIDTH;
+
+        XDrawRectangle(display, window, gc,
+                       x, 0, TAB_WIDTH, TAB_BAR_HEIGHT);
+
+        char label[32];
+        snprintf(label, sizeof(label), "Tab %d", i + 1);
+
+        XDrawString(display, window, gc,
+                    x + 10, 20, label, (int)strlen(label));
+        XDrawString(display, window, gc,
+            x + TAB_WIDTH - 18, 20, "x", 1);
+    }
+
+    XDrawRectangle(display, window, gc,
+                   tab_count * TAB_WIDTH, 0,
+                   TAB_WIDTH, TAB_BAR_HEIGHT);
+
+    XDrawString(display, window, gc,
+                tab_count * TAB_WIDTH + 10, 20,
+                "+", 1);
+    
+}
+
 /* Redraw the complete GUI. */
 void draw_input(Display *display, Window window, GC gc,
                 const char *input, int length,
@@ -156,26 +303,30 @@ void draw_input(Display *display, Window window, GC gc,
 {
     XClearWindow(display, window);
 
+    draw_tabs(display, window, gc);
+
     draw_output(display, window, gc, output, output_length);
+    
+    const char *prompt = tabs[active_tab].continuing
+                     ? ">"
+                     : "Terminator>";
 
     XDrawString(display, window, gc,
-                10, PROMPT_Y, "Terminator>", 11);
+                10, PROMPT_Y, prompt, (int)strlen(prompt));
+
+    int input_x = tabs[active_tab].continuing
+                ? 25
+                : 120;
 
     XDrawString(display, window, gc,
-                120, PROMPT_Y, input, length);
-
+                input_x, PROMPT_Y, input, length);
     XFlush(display);
 }
 
-/* Execute one command and capture its stdout and stderr. */
-int run_command(char *args[],
-                char **output, int *output_capacity,
-                int *output_length)
-{
-    int output_pipe[2];
 
-    if (pipe(output_pipe) == -1) {
-        perror("pipe");
+int run_background(char *args[], const char *command)
+{
+    if (job_count >= MAX_JOBS) {
         return -1;
     }
 
@@ -183,273 +334,89 @@ int run_command(char *args[],
 
     if (pid == -1) {
         perror("fork");
-        close(output_pipe[0]);
-        close(output_pipe[1]);
         return -1;
     }
 
     if (pid == 0) {
-        close(output_pipe[0]);
-
-        if (dup2(output_pipe[1], STDOUT_FILENO) == -1 ||
-            dup2(output_pipe[1], STDERR_FILENO) == -1) {
+        /* Create a separate process group for this job. */
+        if (setpgid(0, 0) == -1) {
+            perror("setpgid");
             _exit(1);
         }
 
-        close(output_pipe[1]);
-
         execvp(args[0], args);
-
         perror("execvp");
         _exit(127);
     }
 
-    close(output_pipe[1]);
-
-    char buffer[257];
-    ssize_t bytes_read;
-
-    while (1) {
-        bytes_read = read(output_pipe[0], buffer, sizeof(buffer) - 1);
-
-        if (bytes_read > 0) {
-            buffer[bytes_read] = '\0';
-
-            if (append_output(output, output_capacity,
-                              output_length, buffer) == -1) {
-                close(output_pipe[0]);
-                waitpid(pid, NULL, 0);
-                return -1;
-            }
-        } else if (bytes_read == 0) {
-            break;
-        } else if (errno == EINTR) {
-            continue;
-        } else {
-            perror("read");
-            close(output_pipe[0]);
-            waitpid(pid, NULL, 0);
-            return -1;
-        }
+    /* The parent also attempts to set the child's process group. */
+    if (setpgid(pid, pid) == -1) {
+        perror("setpgid");
     }
 
-    close(output_pipe[0]);
+    jobs[job_count].pid = pid;
+    jobs[job_count].pgid = pid;
 
-    int status;
+    snprintf(jobs[job_count].command,
+             sizeof(jobs[job_count].command),
+             "%s", command);
 
-    while (waitpid(pid, &status, 0) == -1) {
-        if (errno == EINTR) {
-            continue;
-        }
+    jobs[job_count].running = 1;
+    jobs[job_count].stopped = 0;
+    job_count++;
 
-        perror("waitpid");
-        return -1;
-    }
-
-    return 0;
+    return (int)pid;
 }
 
-/*
- * Split one pipeline stage into arguments.
- *
- * Example:
- * "wc -l" becomes {"wc", "-l", NULL}.
- */
-int parse_command(char *command, char *args[MAX_PIPE_ARGS])
+
+
+void update_job_status(void)
 {
-    int arg_count = 0;
-    char *saveptr = NULL;
+    for (int i = 0; i < job_count; i++) {
+        if (!jobs[i].running) {
+            continue;
+        }
 
-    char *token = strtok_r(command, " \t", &saveptr);
+        int status;
+        pid_t result = waitpid(
+            jobs[i].pid,
+            &status,
+            WNOHANG | WUNTRACED | WCONTINUED
+        );
 
-    while (token != NULL && arg_count < MAX_PIPE_ARGS - 1) {
-        args[arg_count++] = token;
-        token = strtok_r(NULL, " \t", &saveptr);
+        if (result == jobs[i].pid) {
+            if (WIFSTOPPED(status)) {
+                jobs[i].stopped = 1;
+            }
+            else if (WIFCONTINUED(status)) {
+                jobs[i].stopped = 0;
+            }
+            else if (WIFEXITED(status) || WIFSIGNALED(status)) {
+                jobs[i].running = 0;
+                jobs[i].stopped = 0;
+            }
+        }
     }
-
-    if (token != NULL) {
-        return -1;
-    }
-
-    args[arg_count] = NULL;
-
-    return arg_count;
 }
 
-/*
- * Execute a pipeline containing two or more commands.
- *
- * Example:
- * ls | sort | uniq | wc -l
- */
-int run_pipeline(char *commands[][MAX_PIPE_ARGS], int command_count,
-                 char **output, int *output_capacity,
-                 int *output_length)
+int find_job(int job_number)
 {
-    int pipes[MAX_PIPE_COMMANDS - 1][2];
-    int output_pipe[2];
-    pid_t pids[MAX_PIPE_COMMANDS];
-    int started = 0;
-
-    if (command_count < 2 || command_count > MAX_PIPE_COMMANDS) {
+    if (job_number < 1 || job_number > job_count) {
         return -1;
     }
 
-    /* Create the pipes connecting the commands. */
-    for (int i = 0; i < command_count - 1; i++) {
-        if (pipe(pipes[i]) == -1) {
-            perror("pipe");
+    return job_number - 1;
+}
 
-            for (int j = 0; j < i; j++) {
-                close(pipes[j][0]);
-                close(pipes[j][1]);
-            }
 
-            return -1;
-        }
+int read_script_line(FILE *script, char line[INPUT_SIZE])
+{
+    if (fgets(line, INPUT_SIZE, script) == NULL) {
+        return 0;
     }
 
-    /* This pipe sends the final output to the GUI. */
-    if (pipe(output_pipe) == -1) {
-        perror("output pipe");
-
-        for (int i = 0; i < command_count - 1; i++) {
-            close(pipes[i][0]);
-            close(pipes[i][1]);
-        }
-
-        return -1;
-    }
-
-    /* Start one child process for every command. */
-    for (int i = 0; i < command_count; i++) {
-        pids[i] = fork();
-
-        if (pids[i] == -1) {
-            perror("fork");
-
-            for (int j = 0; j < command_count - 1; j++) {
-                close(pipes[j][0]);
-                close(pipes[j][1]);
-            }
-
-            close(output_pipe[0]);
-            close(output_pipe[1]);
-
-            for (int j = 0; j < started; j++) {
-                kill(pids[j], SIGTERM);
-            }
-
-            for (int j = 0; j < started; j++) {
-                while (waitpid(pids[j], NULL, 0) == -1 &&
-                       errno == EINTR) {
-                }
-            }
-
-            return -1;
-        }
-
-        if (pids[i] == 0) {
-            /* Read input from the previous command. */
-            if (i > 0) {
-                if (dup2(pipes[i - 1][0], STDIN_FILENO) == -1) {
-                    _exit(1);
-                }
-            }
-
-            /* Send output to the next command. */
-            if (i < command_count - 1) {
-                if (dup2(pipes[i][1], STDOUT_FILENO) == -1) {
-                    _exit(1);
-                }
-            } else {
-                /* The last command sends output to the GUI. */
-                if (dup2(output_pipe[1], STDOUT_FILENO) == -1) {
-                    _exit(1);
-                }
-            }
-
-            /* Capture errors from every command in the GUI. */
-            if (dup2(output_pipe[1], STDERR_FILENO) == -1) {
-                _exit(1);
-            }
-
-            /* Close original descriptors after dup2(). */
-            for (int j = 0; j < command_count - 1; j++) {
-                close(pipes[j][0]);
-                close(pipes[j][1]);
-            }
-
-            close(output_pipe[0]);
-            close(output_pipe[1]);
-
-            execvp(commands[i][0], commands[i]);
-
-            perror("execvp");
-            _exit(127);
-        }
-
-        started++;
-    }
-
-    /* The parent does not use the pipeline's internal pipes. */
-    for (int i = 0; i < command_count - 1; i++) {
-        close(pipes[i][0]);
-        close(pipes[i][1]);
-    }
-
-    close(output_pipe[1]);
-
-    /* Read the final output without assuming it fits in one buffer. */
-    char buffer[257];
-    ssize_t bytes_read;
-    int read_error = 0;
-
-    while (1) {
-        bytes_read = read(output_pipe[0], buffer, sizeof(buffer) - 1);
-
-        if (bytes_read > 0) {
-            buffer[bytes_read] = '\0';
-
-            if (append_output(output, output_capacity,
-                              output_length, buffer) == -1) {
-                read_error = 1;
-                break;
-            }
-        } else if (bytes_read == 0) {
-            break;
-        } else if (errno == EINTR) {
-            continue;
-        } else {
-            perror("read");
-            read_error = 1;
-            break;
-        }
-    }
-
-    close(output_pipe[0]);
-
-    if (read_error) {
-        for (int i = 0; i < command_count; i++) {
-            kill(pids[i], SIGTERM);
-        }
-    }
-
-    int wait_error = 0;
-
-    for (int i = 0; i < command_count; i++) {
-        while (waitpid(pids[i], NULL, 0) == -1) {
-            if (errno == EINTR) {
-                continue;
-            }
-
-            perror("waitpid");
-            wait_error = 1;
-            break;
-        }
-    }
-
-    return (read_error || wait_error) ? -1 : 0;
+    line[strcspn(line, "\n")] = '\0';
+    return 1;
 }
 
 int main(void)
@@ -488,23 +455,19 @@ int main(void)
 
     GC gc = XCreateGC(display, window, 0, NULL);
 
-    char input[INPUT_SIZE] = {0};
-    int length = 0;
+    /* Initialize the first tab. */
+    tab_count = 1;
+    active_tab = 0;
 
-    int output_capacity = 4096;
-    int output_length = 0;
-
-    char *output = malloc((size_t)output_capacity);
-
-    if (output == NULL) {
-        fprintf(stderr, "Cannot allocate output buffer.\n");
+    if (initialize_tab(0) == -1) {
+        fprintf(stderr, "Cannot initialize first tab.\n");
         XFreeGC(display, gc);
         XDestroyWindow(display, window);
         XCloseDisplay(display);
         return 1;
     }
 
-    output[0] = '\0';
+    Tab *tab = &tabs[active_tab];
 
     XEvent event;
     int running = 1;
@@ -513,8 +476,11 @@ int main(void)
         XNextEvent(display, &event);
 
         if (event.type == Expose) {
+            tab = &tabs[active_tab];
+
             draw_input(display, window, gc,
-                       input, length, output, output_length);
+                       tab->input, tab->length,
+                       tab->output, tab->output_length);
         }
 
         else if (event.type == ClientMessage) {
@@ -524,21 +490,70 @@ int main(void)
         }
 
         else if (event.type == ButtonPress) {
-            if (event.xbutton.button == Button4) {
-                if (scroll_offset < count_output_lines(output, output_length)) {
-                    scroll_offset++;
+            int click_x = event.xbutton.x;
+            int click_y = event.xbutton.y;
+
+            /* Handle clicks on the tab bar. */
+            if (click_y < TAB_BAR_HEIGHT) {
+                int clicked_tab = click_x / TAB_WIDTH;
+
+                if (clicked_tab < tab_count) {
+                    int close_x =
+                        (clicked_tab + 1) * TAB_WIDTH - 20;
+
+                    if (click_x >= close_x) {
+                        close_tab(clicked_tab);
+                    }
+                    else {
+                        active_tab = clicked_tab;
+
+                        if (chdir(tabs[active_tab].cwd) == -1) {
+                            /* Keep the current directory if restoration fails. */
+                        }
+                    }
                 }
-            } else if (event.xbutton.button == Button5) {
-                if (scroll_offset > 0) {
-                    scroll_offset--;
+
+                else if (clicked_tab == tab_count &&
+                         tab_count < MAX_TABS) {
+                    int new_index = tab_count;
+
+                    if (initialize_tab(new_index) == 0) {
+                        tab_count++;
+                        active_tab = new_index;
+                    }
                 }
             }
 
+            /* Handle mouse-wheel scrolling outside the tab bar. */
+            else if (event.xbutton.button == Button4) {
+                tab = &tabs[active_tab];
+
+                if (tab->scroll_offset <
+                    count_output_lines(tab->output,
+                                       tab->output_length)) {
+                    tab->scroll_offset++;
+                }
+            }
+
+            else if (event.xbutton.button == Button5) {
+                tab = &tabs[active_tab];
+
+                if (tab->scroll_offset > 0) {
+                    tab->scroll_offset--;
+                }
+            }
+
+            /* Refresh the pointer after switching or closing tabs. */
+            tab = &tabs[active_tab];
+
             draw_input(display, window, gc,
-                       input, length, output, output_length);
+                       tab->input, tab->length,
+                       tab->output, tab->output_length);
         }
 
         else if (event.type == KeyPress) {
+            tab = &tabs[active_tab];
+
             KeySym key;
             char key_text[32];
 
@@ -552,46 +567,223 @@ int main(void)
 
             /* Enter: execute the command. */
             if (key == XK_Return || key == XK_KP_Enter) {
-                if (length == 0) {
-                    append_output(&output, &output_capacity,
-                      &output_length, "Terminator>\n");
-
-                    scroll_offset = 0;
+                
+                /* Handle multiline commands before normal execution. */
+                if (tab->length > 0) {
+                    tab->input[tab->length] = '\0';
                 }
-                if (length > 0) {
-                    input[length] = '\0';
 
-                    char command[INPUT_SIZE];
-                    strcpy(command, input);
+                /* Case 1: A trailing backslash continues the command. */
+                if (tab->length > 0 &&
+                    tab->input[tab->length - 1] == '\\') {
 
-                    int has_pipeline = strchr(command, '|') != NULL;
+                    int line_length = tab->length - 1;
 
-                    /* Save non-empty commands in history. */
-                    if (history_count < 100) {
-                        strcpy(history[history_count], input);
-                        history_count++;
-                    } else {
-                        for (int i = 1; i < 100; i++) {
-                            strcpy(history[i - 1], history[i]);
-                        }
+                    if (tab->pending_length + line_length >= INPUT_SIZE) {
+                        append_output(&tab->output,
+                                    &tab->output_capacity,
+                                    &tab->output_length,
+                                    "Terminator: command too long.\n");
 
-                        strcpy(history[99], input);
+                        tab->pending_input[0] = '\0';
+                        tab->pending_length = 0;
+                        tab->continuing = 0;
+                        tab->length = 0;
+                        tab->input[0] = '\0';
+                    }
+                    else {
+                        memcpy(tab->pending_input + tab->pending_length,
+                            tab->input, (size_t)line_length);
+
+                        tab->pending_length += line_length;
+                        tab->pending_input[tab->pending_length] = '\0';
+
+                        tab->continuing = 1;
+                        tab->length = 0;
+                        tab->input[0] = '\0';
                     }
 
-                    history_position = history_count;
+                    draw_input(display, window, gc,
+                            tab->input, tab->length,
+                            tab->output, tab->output_length);
+
+                    continue;
+                }
+
+                /* Case 2: Join the current line to previously saved lines. */
+                if (tab->continuing) {
+                    if (tab->pending_length + tab->length >= INPUT_SIZE) {
+                        append_output(&tab->output,
+                                    &tab->output_capacity,
+                                    &tab->output_length,
+                                    "Terminator: command too long.\n");
+
+                        tab->pending_input[0] = '\0';
+                        tab->pending_length = 0;
+                        tab->continuing = 0;
+                        tab->length = 0;
+                        tab->input[0] = '\0';
+
+                        draw_input(display, window, gc,
+                                tab->input, tab->length,
+                                tab->output, tab->output_length);
+
+                        continue;
+                    }
+
+                    memcpy(tab->pending_input + tab->pending_length,
+                        tab->input, (size_t)tab->length);
+
+                    tab->pending_length += tab->length;
+                    tab->pending_input[tab->pending_length] = '\0';
+
+                    memcpy(tab->input, tab->pending_input,
+                        (size_t)tab->pending_length + 1);
+
+                    tab->length = tab->pending_length;
+
+                    tab->pending_input[0] = '\0';
+                    tab->pending_length = 0;
+                    tab->continuing = 0;
+                }
+
+                /* Case 3: An unfinished quote needs another line. */
+                if (tab->length > 0 &&
+                    command_needs_more_input(tab->input)) {
+
+                    if (tab->length + 1 >= INPUT_SIZE) {
+                        append_output(&tab->output,
+                                    &tab->output_capacity,
+                                    &tab->output_length,
+                                    "Terminator: command too long.\n");
+
+                        tab->length = 0;
+                        tab->input[0] = '\0';
+                        tab->pending_length = 0;
+                        tab->pending_input[0] = '\0';
+                        tab->continuing = 0;
+                    }
+                    else {
+                        memcpy(tab->pending_input, tab->input,
+                            (size_t)tab->length);
+
+                        tab->pending_length = tab->length;
+                        tab->pending_input[tab->pending_length++] = '\n';
+                        tab->pending_input[tab->pending_length] = '\0';
+
+                        tab->continuing = 1;
+                        tab->length = 0;
+                        tab->input[0] = '\0';
+                    }
+
+                    draw_input(display, window, gc,
+                            tab->input, tab->length,
+                            tab->output, tab->output_length);
+
+                    continue;
+                }
+
+                if (tab->length == 0) {
+                    append_output(&tab->output,
+                                  &tab->output_capacity,
+                                  &tab->output_length,
+                                  "Terminator>\n");
+
+                    tab->scroll_offset = 0;
+                }
+
+                if (tab->length > 0) {
+                    tab->input[tab->length] = '\0';
+                    char command[INPUT_SIZE];
+                    int command_length = 0;
+
+                    char parameter_quote = '\0';
+                    int parameter_escaped = 0;
+
+                    for (int i = 0; tab->input[i] != '\0'; i++) {
+                        char c = tab->input[i];
+
+                        if (!parameter_escaped &&
+                            parameter_quote != '\'' &&
+                            c == '$' && tab->input[i + 1] == '?') {
+                            char status_text[12];
+                            snprintf(status_text, sizeof(status_text),
+                                     "%d", last_status);
+                            int status_length = (int)strlen(status_text);
+
+                            if (command_length + status_length >= INPUT_SIZE) {
+                                break;
+                            }
+
+                            memcpy(&command[command_length], status_text,
+                                   (size_t)status_length);
+                            command_length += status_length;
+                            i++;
+                            continue;
+                        }
+
+                        if (command_length >= INPUT_SIZE - 1) {
+                            break;
+                        }
+
+                        command[command_length++] = c;
+
+                        if (parameter_escaped) {
+                            parameter_escaped = 0;
+                        } else if (c == '\\' && parameter_quote != '\'') {
+                            parameter_escaped = 1;
+                        } else if (parameter_quote == c) {
+                            parameter_quote = '\0';
+                        } else if (parameter_quote == '\0' &&
+                                   (c == '\'' || c == '"')) {
+                            parameter_quote = c;
+                        }
+                    }
+
+                    command[command_length] = '\0';
+
+
+                    int has_pipeline = find_pipeline_separator(command) != NULL;
+                        
+                    int background = 0;
+                    int background_length = (int)strlen(command);
+                    
+                    while (background_length > 0 &&
+                            (command[background_length - 1] == ' ' ||
+                            command[background_length - 1] == '\t')) {
+                        command[--background_length] = '\0';
+                    }
+                    
+                    if (background_length > 0 &&
+                        command[background_length - 1] == '&') {
+                        background = 1;
+                        command[--background_length] = '\0';
+                    
+                        while (background_length > 0 &&
+                                (command[background_length - 1] == ' ' ||
+                                command[background_length - 1] == '\t')) {
+                            command[--background_length] = '\0';
+                        }
+                    }
+                        
+
+                    history_add(tab->input);
+                    tab->history_position = history_count;
 
                     char command_line[INPUT_SIZE + 20];
 
                     snprintf(command_line, sizeof(command_line),
-                             "Terminator> %s\n", input);
+                             "Terminator> %s\n", tab->input);
 
-                    if (append_output(&output, &output_capacity,
-                                      &output_length, command_line) == -1) {
+                    if (append_output(&tab->output,
+                                      &tab->output_capacity,
+                                      &tab->output_length,
+                                      command_line) == -1) {
                         running = 0;
                         continue;
                     }
 
-                    scroll_offset = 0;
+                    tab->scroll_offset = 0;
 
                     if (has_pipeline) {
                         char *commands[MAX_PIPE_COMMANDS][MAX_PIPE_ARGS] = {
@@ -601,15 +793,11 @@ int main(void)
                         int command_count = 0;
                         int parse_error = 0;
 
-                        /*
-                         * Split stages manually so empty stages such as
-                         * "ls || wc" can be detected.
-                         */
                         char *stage = command;
                         char *separator;
 
                         while (1) {
-                            separator = strchr(stage, '|');
+                            separator = find_pipeline_separator(stage);
 
                             if (separator != NULL) {
                                 *separator = '\0';
@@ -644,61 +832,71 @@ int main(void)
 
                         if (parse_error) {
                             append_output(
-                                &output, &output_capacity, &output_length,
+                                &tab->output,
+                                &tab->output_capacity,
+                                &tab->output_length,
                                 "Error: invalid pipeline or too many "
                                 "commands/arguments.\n"
                             );
-                        } else {
-                            if (run_pipeline(commands, command_count,
-                                             &output, &output_capacity,
-                                             &output_length) == -1) {
+                        }
+                        
+                        else {
+                            last_status = run_pipeline(
+                            commands, command_count,
+                            &tab->output,
+                            &tab->output_capacity,
+                            &tab->output_length
+                            );
+
+                            if (last_status == -1) {
                                 append_output(
-                                    &output, &output_capacity,
-                                    &output_length,
+                                    &tab->output,
+                                    &tab->output_capacity,
+                                    &tab->output_length,
                                     "Error executing pipeline.\n"
                                 );
+
+                            last_status = 1;
                             }
                         }
                     }
 
                     else {
-                        char *args[10];
-                        int arg_count = 0;
-                        char *saveptr = NULL;
+                        char *args[MAX_PIPE_ARGS];
 
-                        char *token = strtok_r(command, " \t", &saveptr);
+                        int arg_count = parse_command(command, args);
 
-                        while (token != NULL && arg_count < 9) {
-                            args[arg_count++] = token;
-                            token = strtok_r(NULL, " \t", &saveptr);
-                        }
-
-                        args[arg_count] = NULL;
-
-                        if (token != NULL) {
+                        if (arg_count < 0) {
                             append_output(
-                                &output, &output_capacity, &output_length,
-                                "Error: too many arguments.\n"
+                                &tab->output,
+                                &tab->output_capacity,
+                                &tab->output_length,
+                                "Error: invalid command or too many arguments.\n"
                             );
                         }
 
+                        
                         else if (arg_count > 0) {
                             if (strcmp(args[0], "cd") == 0) {
                                 const char *directory;
 
                                 if (args[1] == NULL) {
                                     directory = getenv("HOME");
-                                } else {
+                                }
+                                else {
                                     directory = args[1];
                                 }
 
                                 if (directory == NULL) {
                                     append_output(
-                                        &output, &output_capacity,
-                                        &output_length,
+                                        &tab->output,
+                                        &tab->output_capacity,
+                                        &tab->output_length,
                                         "Error: HOME is not set.\n"
                                     );
-                                } else if (chdir(directory) == -1) {
+                                }
+
+                                else if (chdir(directory) == -1) {
                                     char error_message[INPUT_SIZE + 100];
 
                                     snprintf(
@@ -709,106 +907,387 @@ int main(void)
                                     );
 
                                     append_output(
-                                        &output, &output_capacity,
-                                        &output_length, error_message
+                                        &tab->output,
+                                        &tab->output_capacity,
+                                        &tab->output_length,
+                                        error_message
                                     );
+                                }
+
+                                else {
+                                    if (getcwd(tab->cwd,
+                                               sizeof(tab->cwd)) == NULL) {
+                                        tab->cwd[0] = '\0';
+                                    }
+                                }
+                            }
+                            
+                            else if (strcmp(args[0], "source") == 0) {
+                                if (args[1] == NULL) {
+                                    append_output(&tab->output,
+                                                &tab->output_capacity,
+                                                &tab->output_length,
+                                                "source: missing filename\n");
+                                    last_status = 1;
+                                } else {
+                                    FILE *script = fopen(args[1], "r");
+
+                                    if (script == NULL) {
+                                        char error_message[INPUT_SIZE + 100];
+
+                                        snprintf(error_message, sizeof(error_message),
+                                                "source: %s: %s\n",
+                                                args[1], strerror(errno));
+
+                                        append_output(&tab->output,
+                                                    &tab->output_capacity,
+                                                    &tab->output_length,
+                                                    error_message);
+                                        last_status = 1;
+                                    } else {
+                                        char line[INPUT_SIZE];
+
+                                        while (read_script_line(script, line)) {
+                                            if (line[0] == '\0') {
+                                                continue;
+                                            }
+
+                                            char *script_args[10];
+                                            int count = 0;
+
+                                            char *token = strtok(line, " \t");
+
+                                            while (token != NULL && count < 9) {
+                                                script_args[count++] = token;
+                                                token = strtok(NULL, " \t");
+                                            }
+
+                                            script_args[count] = NULL;
+
+                                            if (count == 0) {
+                                                continue;
+                                            }
+
+                                            if (strcmp(script_args[0], "cd") == 0) {
+                                                const char *directory =
+                                                    script_args[1] != NULL
+                                                    ? script_args[1] : getenv("HOME");
+
+                                                if (directory == NULL || chdir(directory) == -1) {
+                                                    append_output(&tab->output,
+                                                                &tab->output_capacity,
+                                                                &tab->output_length,
+                                                                "source: cd failed\n");
+                                                    last_status = 1;
+                                                } else {
+                                                    if (getcwd(tab->cwd, sizeof(tab->cwd)) == NULL) {
+                                                        tab->cwd[0] = '\0';
+                                                    }
+                                                    last_status = 0;
+                                                }
+                                            } else if (strcmp(script_args[0], "exit") == 0) {
+                                                running = 0;
+                                                break;
+                                            } else {
+                                                last_status = run_command(
+                                                    script_args,
+                                                    &tab->output,
+                                                    &tab->output_capacity,
+                                                    &tab->output_length
+                                                );
+
+                                                if (last_status == -1) {
+                                                    last_status = 1;
+                                                    append_output(&tab->output,
+                                                                &tab->output_capacity,
+                                                                &tab->output_length,
+                                                                "source: command execution failed\n");
+                                                }
+                                            }
+                                        }
+
+                                        fclose(script);
+                                    }
+                                }
+                            }
+                            else if (strcmp(args[0], "history") == 0) {
+                                for (int i = 0; i < history_count; i++) {
+                                    char history_line[120];
+
+                                    snprintf(history_line, sizeof(history_line),
+                                            "%d  %s\n", i + 1, history[i]);
+
+                                    if (append_output(&tab->output,
+                                                    &tab->output_capacity,
+                                                    &tab->output_length,
+                                                    history_line) == -1) {
+                                        last_status = 1;
+                                        break;
+                                    }
+                                }
+
+                                last_status = 0;
+                            }                            
+                            else if (strcmp(args[0], "jobs") == 0) {
+                                update_job_status();
+
+                                for (int i = 0; i < job_count; i++) {
+                                    char job_line[INPUT_SIZE + 100];
+                                    const char *state;
+
+                                    if (!jobs[i].running) {
+                                        state = "Done";
+                                    } else if (jobs[i].stopped) {
+                                        state = "Stopped";
+                                    } else {
+                                        state = "Running";
+                                    }
+
+                                    snprintf(job_line, sizeof(job_line),
+                                            "[%d] %s %s\n",
+                                            i + 1, state, jobs[i].command);
+
+                                    if (append_output(&tab->output,
+                                                    &tab->output_capacity,
+                                                    &tab->output_length,
+                                                    job_line) == -1) {
+                                        last_status = 1;
+                                        break;
+                                    }
+                                }
+                                if (last_status != 1) {
+                                    last_status = 0;
+                                }
+                            }
+                            
+                            else if (strcmp(args[0], "bg") == 0) {
+                                int job_number = job_count;
+
+                                if (args[1] != NULL) {
+                                    job_number = atoi(args[1]);
+                                }
+
+                                int index = find_job(job_number);
+
+                                if (index == -1 || !jobs[index].running) {
+                                    append_output(&tab->output,
+                                                &tab->output_capacity,
+                                                &tab->output_length,
+                                                "bg: invalid or finished job\n");
+                                    last_status = 1;
+                                } else if (kill(-jobs[index].pgid, SIGCONT) == -1) {
+                                    perror("bg: SIGCONT");
+                                    last_status = 1;
+                                } else {
+                                    jobs[index].stopped = 0;
+                                    jobs[index].running = 1;
+
+                                    char message[INPUT_SIZE + 100];
+                                    snprintf(message, sizeof(message),
+                                            "[%d] Running %s\n",
+                                            job_number, jobs[index].command);
+
+                                    append_output(&tab->output,
+                                                &tab->output_capacity,
+                                                &tab->output_length,
+                                                message);
+                                    last_status = 0;
+                                }
+                            }
+                            
+                            else if (strcmp(args[0], "fg") == 0) {
+                                int job_number = job_count;
+
+                                if (args[1] != NULL) {
+                                    job_number = atoi(args[1]);
+                                }
+
+                                int index = find_job(job_number);
+
+                                if (index == -1 || !jobs[index].running) {
+                                    append_output(&tab->output,
+                                                &tab->output_capacity,
+                                                &tab->output_length,
+                                                "fg: invalid or finished job\n");
+                                    last_status = 1;
+                                } else {
+                                    if (kill(-jobs[index].pgid, SIGCONT) == -1) {
+                                        perror("fg: SIGCONT");
+                                        last_status = 1;
+                                    } else {
+                                        jobs[index].stopped = 0;
+
+                                        int status;
+                                        pid_t result;
+
+                                        do {
+                                            result = waitpid(jobs[index].pid,
+                                                            &status,
+                                                            WUNTRACED);
+                                        } while (result == -1 && errno == EINTR);
+
+                                        if (result == -1) {
+                                            perror("fg: waitpid");
+                                            last_status = 1;
+                                        } else if (WIFSTOPPED(status)) {
+                                            jobs[index].stopped = 1;
+                                            last_status = 128 + WSTOPSIG(status);
+                                        } else {
+                                            jobs[index].running = 0;
+                                            jobs[index].stopped = 0;
+
+                                            if (WIFEXITED(status)) {
+                                                last_status = WEXITSTATUS(status);
+                                            } else if (WIFSIGNALED(status)) {
+                                                last_status = 128 + WTERMSIG(status);
+                                            } else {
+                                                last_status = 1;
+                                            }
+                                        }
+                                    }
                                 }
                             }
 
                             else if (strcmp(args[0], "exit") == 0) {
                                 running = 0;
-                            }
-
+                            }                            
                             else {
-                                if (run_command(args,
-                                                &output, &output_capacity,
-                                                &output_length) == -1) {
-                                    append_output(
-                                        &output, &output_capacity,
-                                        &output_length,
-                                        "Error executing command.\n"
+                                if (background) {
+                                    int pid = run_background(args, tab->input);
+
+                                    if (pid == -1) {
+                                        last_status = 1;
+
+                                        append_output(
+                                            &tab->output,
+                                            &tab->output_capacity,
+                                            &tab->output_length,
+                                            "Error starting background command.\n"
+                                        );
+                                    }
+                                    else {
+                                        last_status = 0;
+
+                                        char message[64];
+                                        snprintf(message, sizeof(message),
+                                                "[%d] Started\n", pid);
+
+                                        append_output(
+                                            &tab->output,
+                                            &tab->output_capacity,
+                                            &tab->output_length,
+                                            message
+                                        );
+                                    }
+                                }
+                                else {
+                                    last_status = run_command(
+                                        args,
+                                        &tab->output,
+                                        &tab->output_capacity,
+                                        &tab->output_length
                                     );
+
+                                    if (last_status == -1) {
+                                        append_output(
+                                            &tab->output,
+                                            &tab->output_capacity,
+                                            &tab->output_length,
+                                            "Error executing command.\n"
+                                        );
+
+                                        last_status = 1;
+                                    }
                                 }
                             }
                         }
                     }
 
-                    length = 0;
-                    input[0] = '\0';
-                    history_position = history_count;
+                    tab->length = 0;
+                    tab->input[0] = '\0';
+                    tab->history_position = history_count;
                 }
-
-                draw_input(display, window, gc,
-                           input, length, output, output_length);
             }
 
             /* Backspace: delete one character. */
             else if (key == XK_BackSpace || key == XK_Delete) {
-                if (length > 0) {
-                    length--;
-                    input[length] = '\0';
+                if (tab->length > 0) {
+                    tab->length--;
+                    tab->input[tab->length] = '\0';
                 }
             }
 
             /* Up arrow: previous command. */
             else if (key == XK_Up) {
-                if (history_position > 0) {
-                    history_position--;
+                if (tab->history_position > 0) {
+                    tab->history_position--;
 
-                    strcpy(input, history[history_position]);
-                    length = (int)strlen(input);
+                    strcpy(tab->input,
+                           history[tab->history_position]);
+
+                    tab->length = (int)strlen(tab->input);
                 }
             }
 
             /* Down arrow: next command. */
             else if (key == XK_Down) {
-                if (history_position < history_count - 1) {
-                    history_position++;
+                if (tab->history_position < history_count - 1) {
+                    tab->history_position++;
 
-                    strcpy(input, history[history_position]);
-                    length = (int)strlen(input);
-                } else {
-                    history_position = history_count;
-                    length = 0;
-                    input[0] = '\0';
+                    strcpy(tab->input,
+                           history[tab->history_position]);
+
+                    tab->length = (int)strlen(tab->input);
+                }
+                else {
+                    tab->history_position = history_count;
+                    tab->length = 0;
+                    tab->input[0] = '\0';
                 }
             }
 
             /* Ctrl+L: clear displayed output. */
             else if ((key == XK_l || key == XK_L) &&
                      (event.xkey.state & ControlMask)) {
-                output_length = 0;
-                output[0] = '\0';
-                scroll_offset = 0;
+                tab->output_length = 0;
+                tab->output[0] = '\0';
+                tab->scroll_offset = 0;
             }
 
             /* Ctrl+D: exit when the input is empty. */
             else if (key == XK_d &&
                      (event.xkey.state & ControlMask) &&
-                     length == 0) {
+                     tab->length == 0) {
                 running = 0;
             }
 
             /* Append ordinary typed characters. */
             else if (key_length > 0 &&
                      !(event.xkey.state & ControlMask) &&
-                     length < INPUT_SIZE - 1) {
-                for (int i = 0; i < key_length &&
-                                length < INPUT_SIZE - 1; i++) {
+                     tab->length < INPUT_SIZE - 1) {
+                for (int i = 0;
+                     i < key_length &&
+                     tab->length < INPUT_SIZE - 1;
+                     i++) {
                     if (key_text[i] >= ' ' && key_text[i] != 127) {
-                        input[length++] = key_text[i];
+                        tab->input[tab->length++] = key_text[i];
                     }
                 }
 
-                input[length] = '\0';
+                tab->input[tab->length] = '\0';
             }
 
             draw_input(display, window, gc,
-                       input, length, output, output_length);
+                       tab->input, tab->length,
+                       tab->output, tab->output_length);
         }
     }
 
-    free(output);
+    /* Free every tab's output buffer. */
+    for (int i = 0; i < tab_count; i++) {
+        free(tabs[i].output);
+    }
+
     XFreeGC(display, gc);
     XDestroyWindow(display, window);
     XCloseDisplay(display);
