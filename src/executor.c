@@ -107,9 +107,15 @@ int run_command(char *args[],
  * Example:
  * ls | sort | uniq | wc -l
  */
-int run_pipeline(char *commands[][MAX_PIPE_ARGS], int command_count,
-                 char **output, int *output_capacity,
-                 int *output_length)
+ int run_pipeline(
+    char *commands[][MAX_PIPE_ARGS],
+    int command_count,
+    const char *input_file,
+    const char *output_file,
+    char **output,
+    int *output_capacity,
+    int *output_length
+)
 {
     int pipes[MAX_PIPE_COMMANDS - 1][2];
     int output_pipe[2];
@@ -197,6 +203,46 @@ int run_pipeline(char *commands[][MAX_PIPE_ARGS], int command_count,
             /* Capture errors from every command in the GUI. */
             if (dup2(output_pipe[1], STDERR_FILENO) == -1) {
                 _exit(1);
+            }
+
+            /* Redirect input for the first command. */
+            if (i == 0 && input_file != NULL) {
+                int fd = open(input_file, O_RDONLY);
+
+                if (fd == -1) {
+                    perror(input_file);
+                    _exit(1);
+                }
+
+                if (dup2(fd, STDIN_FILENO) == -1) {
+                    perror("dup2 stdin");
+                    close(fd);
+                    _exit(1);
+                }
+
+                close(fd);
+            }
+
+            /* Redirect output for the last command. */
+            if (i == command_count - 1 && output_file != NULL) {
+                int fd = open(
+                    output_file,
+                    O_WRONLY | O_CREAT | O_TRUNC,
+                    0666
+                );
+
+                if (fd == -1) {
+                    perror(output_file);
+                    _exit(1);
+                }
+
+                if (dup2(fd, STDOUT_FILENO) == -1) {
+                    perror("dup2 stdout");
+                    close(fd);
+                    _exit(1);
+                }
+
+                close(fd);
             }
 
             /* Close original descriptors after dup2(). */

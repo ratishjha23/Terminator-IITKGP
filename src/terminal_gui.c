@@ -796,7 +796,20 @@ int main(void)
                         char *stage = command;
                         char *separator;
 
-                        while (1) {
+                        char input_file[INPUT_SIZE] = "";
+                        char output_file[INPUT_SIZE] = "";
+
+                        int redirection_status = parse_redirections(
+                            command,
+                            input_file, sizeof(input_file),
+                            output_file, sizeof(output_file)
+                        );
+
+                        if (redirection_status != 0) {
+                            parse_error = 1;
+                        }
+
+                        while (!parse_error) {
                             separator = find_pipeline_separator(stage);
 
                             if (separator != NULL) {
@@ -842,10 +855,13 @@ int main(void)
                         
                         else {
                             last_status = run_pipeline(
-                            commands, command_count,
-                            &tab->output,
-                            &tab->output_capacity,
-                            &tab->output_length
+                                commands,
+                                command_count,
+                                input_file[0] != '\0' ? input_file : NULL,
+                                output_file[0] != '\0' ? output_file : NULL,
+                                &tab->output,
+                                &tab->output_capacity,
+                                &tab->output_length
                             );
 
                             if (last_status == -1) {
