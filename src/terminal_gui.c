@@ -11,6 +11,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 #include "executor.h"
 #include "output_buffer.h"
@@ -324,7 +325,13 @@ void draw_input(Display *display, Window window, GC gc,
 }
 
 
-int run_background(char *args[], const char *command)
+
+int run_background(
+    char *args[],
+    const char *command,
+    const char *input_file,
+    const char *output_file
+)
 {
     if (job_count >= MAX_JOBS) {
         return -1;
@@ -344,8 +351,48 @@ int run_background(char *args[], const char *command)
             _exit(1);
         }
 
+        /* Apply input redirection. */
+        if (input_file != NULL) {
+            int fd = open(input_file, O_RDONLY);
+
+            if (fd == -1) {
+                perror(input_file);
+                _exit(1);
+            }
+
+            if (dup2(fd, STDIN_FILENO) == -1) {
+                perror("dup2 stdin");
+                close(fd);
+                _exit(1);
+            }
+
+            close(fd);
+        }
+
+        /* Apply output redirection. */
+        if (output_file != NULL) {
+            int fd = open(
+                output_file,
+                O_WRONLY | O_CREAT | O_TRUNC,
+                0666
+            );
+
+            if (fd == -1) {
+                perror(output_file);
+                _exit(1);
+            }
+
+            if (dup2(fd, STDOUT_FILENO) == -1) {
+                perror("dup2 stdout");
+                close(fd);
+                _exit(1);
+            }
+
+            close(fd);
+        }
+
         execvp(args[0], args);
-        perror("execvp");
+        perror(args[0]);
         _exit(127);
     }
 
@@ -357,9 +404,12 @@ int run_background(char *args[], const char *command)
     jobs[job_count].pid = pid;
     jobs[job_count].pgid = pid;
 
-    snprintf(jobs[job_count].command,
-             sizeof(jobs[job_count].command),
-             "%s", command);
+    snprintf(
+        jobs[job_count].command,
+        sizeof(jobs[job_count].command),
+        "%s",
+        command
+    );
 
     jobs[job_count].running = 1;
     jobs[job_count].stopped = 0;
@@ -367,8 +417,6 @@ int run_background(char *args[], const char *command)
 
     return (int)pid;
 }
-
-
 
 void update_job_status(void)
 {
@@ -1178,7 +1226,12 @@ int main(void)
                             }                            
                             else {
                                 if (background) {
-                                    int pid = run_background(args, tab->input);
+                                    int pid = run_background(
+                                        args,
+                                        tab->input,
+                                        input_file[0] != '\0' ? input_file : NULL,
+                                        output_file[0] != '\0' ? output_file : NULL
+                                    );
 
                                     if (pid == -1) {
                                         last_status = 1;
