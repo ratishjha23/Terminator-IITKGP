@@ -78,6 +78,10 @@ Tab tabs[MAX_TABS];
 int tab_count = 0;
 int active_tab = 0;
 int last_status = 0;
+/* Mouse selection in the command input line. */
+int selection_start = -1;
+int selection_end = -1;
+int selecting_text = 0;
 
 #define MAX_JOBS 100
 
@@ -319,7 +323,8 @@ void draw_tabs(Display *display, Window window, GC gc)
     
 }
 
-/* Redraw the complete GUI. */
+
+/* Redraw the complete GUI, including selected input text. */
 void draw_input(Display *display, Window window, GC gc,
                 const char *input, int length,
                 const char *output, int output_length)
@@ -327,24 +332,130 @@ void draw_input(Display *display, Window window, GC gc,
     XClearWindow(display, window);
 
     draw_tabs(display, window, gc);
-
     draw_output(display, window, gc, output, output_length);
-    
+
+    /* Keep the original foreground color for normal text. */
+    XGCValues gc_values;
+    XGetGCValues(display, gc, GCForeground, &gc_values);
+    unsigned long normal_color = gc_values.foreground;
+
     const char *prompt = tabs[active_tab].continuing
-                     ? ">"
-                     : "Terminator>";
+                         ? ">"
+                         : "Terminator>";
+
+    XSetForeground(display, gc,
+                   BlackPixel(display, DefaultScreen(display)));
 
     XDrawString(display, window, gc,
                 10, PROMPT_Y, prompt, (int)strlen(prompt));
 
-    int input_x = tabs[active_tab].continuing
-                ? 25
-                : 120;
+    int input_x = tabs[active_tab].continuing ? 25 : 120;
 
-    XDrawString(display, window, gc,
-                input_x, PROMPT_Y, input, length);
+    int start = selection_start;
+    int end = selection_end;
+
+    if (start > end) {
+        int temp = start;
+        start = end;
+        end = temp;
+    }
+
+    /* Clamp selection positions to the current input. */
+    if (start < 0 || end <= start || end > length) {
+        start = -1;
+        end = -1;
+    }
+
+    if (start >= 0) {
+        XFontStruct *font =
+            XQueryFont(display, XGContextFromGC(gc));
+
+        if (font != NULL) {
+            int prefix_width = XTextWidth(font, input, start);
+            int selected_width =
+                XTextWidth(font, input + start, end - start);
+
+            /* Draw the selected region's black background. */
+            XSetForeground(display, gc,
+                           BlackPixel(display, DefaultScreen(display)));
+
+            XFillRectangle(display, window, gc,
+                           input_x + prefix_width,
+                           PROMPT_Y - font->ascent,
+                           (unsigned int)selected_width,
+                           (unsigned int)(font->ascent + font->descent));
+
+            /* Normal text before the selection. */
+            XDrawString(display, window, gc,
+                        input_x, PROMPT_Y, input, start);
+
+            /* Selected text in white. */
+            XSetForeground(display, gc,
+                           WhitePixel(display, DefaultScreen(display)));
+
+            XDrawString(display, window, gc,
+                        input_x + prefix_width, PROMPT_Y,
+                        input + start, end - start);
+
+            /* Normal text after the selection. */
+            XSetForeground(display, gc,
+                           BlackPixel(display, DefaultScreen(display)));
+
+            int suffix_x = input_x +
+                XTextWidth(font, input, end);
+
+            XDrawString(display, window, gc,
+                        suffix_x, PROMPT_Y,
+                        input + end, length - end);
+
+            XFreeFontInfo(NULL, font, 1);
+        } else {
+            XDrawString(display, window, gc,
+                        input_x, PROMPT_Y, input, length);
+        }
+    } else {
+        XDrawString(display, window, gc,
+                    input_x, PROMPT_Y, input, length);
+    }
+
+    /* Restore the GC foreground for subsequent drawing. */
+    XSetForeground(display, gc, normal_color);
+
     XFlush(display);
 }
+
+
+/* Convert a mouse X coordinate to an input character position. */
+int input_position_from_x(Display *display, GC gc,
+                          const char *input, int length,
+                          int input_x, int mouse_x)
+{
+    XFontStruct *font = XQueryFont(display, XGContextFromGC(gc));
+
+    if (font == NULL) {
+        return length;
+    }
+
+    int relative_x = mouse_x - input_x;
+    int position = length;
+
+    if (relative_x <= 0) {
+        position = 0;
+    } else {
+        for (int i = 0; i < length; i++) {
+            int width = XTextWidth(font, input, i + 1);
+
+            if (relative_x < width) {
+                position = i;
+                break;
+            }
+        }
+    }
+
+    XFreeFontInfo(NULL, font, 1);
+    return position;
+}
+
 
 
 
@@ -813,11 +924,13 @@ int main(void)
     XStoreName(display, window, "Terminator - Custom Terminal");
 
     XSelectInput(display, window,
-                 ExposureMask |
-                 StructureNotifyMask |
-                 KeyPressMask |
-                 ButtonPressMask);
-
+        ExposureMask |
+        StructureNotifyMask |
+        KeyPressMask |
+        ButtonPressMask |
+        ButtonReleaseMask |
+        PointerMotionMask);
+    
     Atom wm_delete = XInternAtom(display, "WM_DELETE_WINDOW", False);
     XSetWMProtocols(display, window, &wm_delete, 1);
 
@@ -955,6 +1068,25 @@ int main(void)
                     tab->scroll_offset--;
                 }
             }
+            
+/* Start selecting text in the input line with the left mouse button. */
+            else if (event.xbutton.button == Button1 &&
+                    click_y >= PROMPT_Y - 15 &&
+                    click_y <= PROMPT_Y + 5) {
+                tab = &tabs[active_tab];
+
+                int input_x = tab->continuing ? 25 : 120;
+
+                selection_start = input_position_from_x(
+                    display, gc, tab->input, tab->length,
+                    input_x, click_x
+                );
+
+                selection_end = selection_start;
+                selecting_text = 1;
+            }
+
+
 
             /* Refresh the pointer after switching or closing tabs. */
             tab = &tabs[active_tab];
@@ -963,7 +1095,40 @@ int main(void)
                        tab->input, tab->length,
                        tab->output, tab->output_length);
         }
+        
+        else if (event.type == MotionNotify && selecting_text) {
+            tab = &tabs[active_tab];
 
+            int input_x = tab->continuing ? 25 : 120;
+
+            selection_end = input_position_from_x(
+                display, gc, tab->input, tab->length,
+                input_x, event.xmotion.x
+            );
+
+            draw_input(display, window, gc,
+                    tab->input, tab->length,
+                    tab->output, tab->output_length);
+        }
+        
+        else if (event.type == ButtonRelease &&
+                event.xbutton.button == Button1 &&
+                selecting_text) {
+            tab = &tabs[active_tab];
+
+            int input_x = tab->continuing ? 25 : 120;
+
+            selection_end = input_position_from_x(
+                display, gc, tab->input, tab->length,
+                input_x, event.xbutton.x
+            );
+
+            selecting_text = 0;
+
+            draw_input(display, window, gc,
+                    tab->input, tab->length,
+                    tab->output, tab->output_length);
+        }
         else if (event.type == KeyPress) {
             tab = &tabs[active_tab];
 
