@@ -12,11 +12,14 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <time.h>
+#include <poll.h>
 
 #include "executor.h"
 #include "output_buffer.h"
 #include "parser.h"
 #include "history.h"
+#include "multiwatch.h"
 
 #define WINDOW_WIDTH 500
 #define WINDOW_HEIGHT 300
@@ -33,6 +36,25 @@
 
 #define TAB_BAR_HEIGHT 30
 #define TAB_WIDTH 100
+
+#define MULTIWATCH_REFRESH_SECONDS 2
+
+typedef struct {
+    int running;
+    int round_active;
+    int command_count;
+
+    MultiWatchProcess processes[MULTIWATCH_MAX_COMMANDS];
+
+    char commands[MULTIWATCH_MAX_COMMANDS][INPUT_SIZE];
+
+    int header_printed[MULTIWATCH_MAX_COMMANDS];
+    time_t timestamps[MULTIWATCH_MAX_COMMANDS];
+
+    time_t next_refresh_time;
+} MultiWatchSession;
+
+MultiWatchSession multiwatch_session = {0};
 
 typedef struct {
     char input[INPUT_SIZE];
@@ -466,7 +488,307 @@ int read_script_line(FILE *script, char line[INPUT_SIZE])
     line[strcspn(line, "\n")] = '\0';
     return 1;
 }
+static int parse_multiwatch_commands(
+    const char *input,
+    char commands[][INPUT_SIZE],
+    int *command_count
+) {
+    if (input == NULL || commands == NULL || command_count == NULL) {
+        return -1;
+    }
 
+    *command_count = 0;
+
+    const char *p = input;
+
+    while (*p == ' ' || *p == '\t') {
+        p++;
+    }
+
+    const char keyword[] = "multiWatch";
+    size_t keyword_length = sizeof(keyword) - 1;
+
+    if (strncmp(p, keyword, keyword_length) != 0) {
+        return -1;
+    }
+
+    p += keyword_length;
+
+    if (*p != ' ' && *p != '\t' && *p != '[') {
+        return -1;
+    }
+
+    while (*p == ' ' || *p == '\t') {
+        p++;
+    }
+
+    if (*p != '[') {
+        return -1;
+    }
+
+    p++;
+
+    while (*p == ' ' || *p == '\t') {
+        p++;
+    }
+
+    while (*p != '\0' && *p != ']') {
+        if (*command_count >= MULTIWATCH_MAX_COMMANDS) {
+            return -1;
+        }
+
+        if (*p != '"') {
+            return -1;
+        }
+
+        p++;
+
+        int length = 0;
+
+        while (*p != '\0' && *p != '"') {
+            if (*p == '\\' && p[1] == '"') {
+                p++;
+            }
+
+            if (length >= INPUT_SIZE - 1) {
+                return -1;
+            }
+
+            commands[*command_count][length++] = *p++;
+        }
+
+        if (*p != '"' || length == 0) {
+            return -1;
+        }
+
+        commands[*command_count][length] = '\0';
+        (*command_count)++;
+
+        p++;
+
+        while (*p == ' ' || *p == '\t') {
+            p++;
+        }
+
+        if (*p == ',') {
+            p++;
+
+            while (*p == ' ' || *p == '\t') {
+                p++;
+            }
+        } else if (*p != ']') {
+            return -1;
+        }
+    }
+
+    if (*p != ']' || *command_count == 0) {
+        return -1;
+    }
+
+    p++;
+
+    while (*p == ' ' || *p == '\t') {
+        p++;
+    }
+
+    if (*p != '\0' && *p != '\n') {
+        return -1;
+    }
+
+    return 0;
+}
+static int multiwatch_start_round(void)
+{
+    int count = multiwatch_session.command_count;
+
+    for (int i = 0; i < count; i++) {
+        multiwatch_session.processes[i].pid = -1;
+        multiwatch_session.processes[i].output_fd = -1;
+        multiwatch_session.processes[i].command = NULL;
+        multiwatch_session.processes[i].finished = 1;
+    }
+
+    for (int i = 0; i < count; i++) {
+        if (multiwatch_start(
+                &multiwatch_session.processes[i],
+                multiwatch_session.commands[i]) == -1) {
+
+            multiwatch_stop(
+                multiwatch_session.processes,
+                count
+            );
+
+            multiwatch_session.round_active = 0;
+            return -1;
+        }
+
+        multiwatch_session.header_printed[i] = 0;
+        multiwatch_session.timestamps[i] = time(NULL);
+    }
+
+    multiwatch_session.round_active = 1;
+    return 0;
+}
+static void multiwatch_update(Tab *tab)
+{
+    if (!multiwatch_session.running || tab == NULL) {
+        return;
+    }
+
+    /* Start a new round when the refresh time arrives. */
+    if (!multiwatch_session.round_active) {
+        if (time(NULL) < multiwatch_session.next_refresh_time) {
+            return;
+        }
+
+        if (multiwatch_start_round() == -1) {
+            append_output(
+                &tab->output,
+                &tab->output_capacity,
+                &tab->output_length,
+                "multiWatch: failed to start commands.\n"
+            );
+
+            multiwatch_session.running = 0;
+            return;
+        }
+    }
+
+    char buffer[MULTIWATCH_BUFFER_SIZE];
+
+    /*
+     * Read several ready chunks per update, without waiting
+     * for any command to produce output.
+     */
+    for (int attempt = 0;
+         attempt < MULTIWATCH_MAX_COMMANDS;
+         attempt++) {
+
+        int process_index = -1;
+
+        int bytes_read = multiwatch_read(
+            multiwatch_session.processes,
+            multiwatch_session.command_count,
+            buffer,
+            sizeof(buffer),
+            &process_index
+        );
+
+        if (bytes_read < 0) {
+            append_output(
+                &tab->output,
+                &tab->output_capacity,
+                &tab->output_length,
+                "multiWatch: error reading command output.\n"
+            );
+
+            multiwatch_stop(
+                multiwatch_session.processes,
+                multiwatch_session.command_count
+            );
+
+            multiwatch_session.round_active = 0;
+            multiwatch_session.running = 0;
+            return;
+        }
+
+        if (bytes_read == 0) {
+            break;
+        }
+
+        if (process_index < 0 ||
+            process_index >= multiwatch_session.command_count) {
+            continue;
+        }
+
+        int i = process_index;
+
+        if (multiwatch_session.header_printed[i] == 0) {
+            char header[INPUT_SIZE + 100];
+
+            snprintf(
+                header,
+                sizeof(header),
+                "\"%s\", %lld:\n"
+                "----------------------------------------------------\n",
+                multiwatch_session.commands[i],
+                (long long)multiwatch_session.timestamps[i]
+            );
+
+            append_output(
+                &tab->output,
+                &tab->output_capacity,
+                &tab->output_length,
+                header
+            );
+
+            multiwatch_session.header_printed[i] = 1;
+        }
+
+        append_output(
+            &tab->output,
+            &tab->output_capacity,
+            &tab->output_length,
+            buffer
+        );
+    }
+
+    /*
+     * Close output blocks for commands whose pipes reached EOF.
+     * State 2 means that the block has already been closed.
+     */
+    for (int i = 0;
+         i < multiwatch_session.command_count;
+         i++) {
+
+        if (multiwatch_session.processes[i].finished &&
+            multiwatch_session.header_printed[i] != 2) {
+
+            if (multiwatch_session.header_printed[i] == 0) {
+                char header[INPUT_SIZE + 100];
+
+                snprintf(
+                    header,
+                    sizeof(header),
+                    "\"%s\", %lld:\n"
+                    "----------------------------------------------------\n",
+                    multiwatch_session.commands[i],
+                    (long long)multiwatch_session.timestamps[i]
+                );
+
+                append_output(
+                    &tab->output,
+                    &tab->output_capacity,
+                    &tab->output_length,
+                    header
+                );
+            }
+
+            append_output(
+                &tab->output,
+                &tab->output_capacity,
+                &tab->output_length,
+                "\n----------------------------------------------------\n"
+            );
+
+            multiwatch_session.header_printed[i] = 2;
+        }
+    }
+
+    /* Start the next round two seconds after all commands finish. */
+    if (multiwatch_active_count(
+            multiwatch_session.processes,
+            multiwatch_session.command_count) == 0) {
+
+        multiwatch_stop(
+            multiwatch_session.processes,
+            multiwatch_session.command_count
+        );
+
+        multiwatch_session.round_active = 0;
+        multiwatch_session.next_refresh_time = time(NULL) + 2;
+    }
+}
 int main(void)
 {
     Display *display = XOpenDisplay(NULL);
@@ -521,6 +843,49 @@ int main(void)
     int running = 1;
 
     while (running) {
+        if (multiwatch_session.running) {
+            struct pollfd x_event_fd;
+    
+            x_event_fd.fd = ConnectionNumber(display);
+            x_event_fd.events = POLLIN;
+            x_event_fd.revents = 0;
+    
+            /*
+             * Wait briefly for X11 events instead of busy-waiting.
+             * This gives multiWatch regular opportunities to read output.
+             */
+            int ready = poll(&x_event_fd, 1, 100);
+    
+            if (ready == -1 && errno != EINTR) {
+                perror("poll: X11 event loop");
+                running = 0;
+                break;
+            }
+    
+            if (XPending(display) == 0) {
+                /*
+                 * No X11 event is waiting. Update the active tab's
+                 * multiWatch output, then redraw it.
+                 */
+                 tab = &tabs[active_tab];
+
+                 multiwatch_update(tab);
+                 
+                 draw_input(
+                     display,
+                     window,
+                     gc,
+                     tab->input,
+                     tab->length,
+                     tab->output,
+                     tab->output_length
+                 );
+    
+                XFlush(display);
+                continue;
+            }
+        }
+    
         XNextEvent(display, &event);
 
         if (event.type == Expose) {
@@ -612,6 +977,44 @@ int main(void)
                 &key,
                 NULL
             );
+            /* Stop multiWatch when Ctrl+C is pressed. */
+            if ((event.xkey.state & ControlMask) &&
+                (key == XK_c || key == XK_C)) {
+
+                if (multiwatch_session.running) {
+                    multiwatch_stop(
+                        multiwatch_session.processes,
+                        multiwatch_session.command_count
+                    );
+
+                    multiwatch_session.running = 0;
+                    multiwatch_session.round_active = 0;
+                    multiwatch_session.command_count = 0;
+
+                    append_output(
+                        &tab->output,
+                        &tab->output_capacity,
+                        &tab->output_length,
+                        "\n^C\nmultiWatch stopped.\n"
+                    );
+
+                    tab->scroll_offset = 0;
+
+                    draw_input(
+                        display,
+                        window,
+                        gc,
+                        tab->input,
+                        tab->length,
+                        tab->output,
+                        tab->output_length
+                    );
+
+                    XFlush(display);
+                }
+
+                continue;
+            }
 
             /* Enter: execute the command. */
             if (key == XK_Return || key == XK_KP_Enter) {
@@ -789,9 +1192,92 @@ int main(void)
                     }
 
                     command[command_length] = '\0';
+                    /* Display and store the original multiWatch command. */
+                    history_add(tab->input);
+                    tab->history_position = history_count;
 
+                    char multiwatch_command_line[INPUT_SIZE + 20];
 
+                    snprintf(multiwatch_command_line,
+                            sizeof(multiwatch_command_line),
+                            "Terminator> %s\n", tab->input);
+
+                    append_output(&tab->output,
+                                &tab->output_capacity,
+                                &tab->output_length,
+                                multiwatch_command_line);
+                                                        
+                    /* Handle the multiWatch command before normal command parsing. */
+                    if (strncmp(command, "multiWatch", 10) == 0 &&
+                        (command[10] == ' ' || command[10] == '\t' ||
+                        command[10] == '[')) {
+
+                        int parsed_count = 0;
+
+                        char parsed_commands[MULTIWATCH_MAX_COMMANDS][INPUT_SIZE];
+
+                        if (multiwatch_session.running) {
+                            append_output(
+                                &tab->output,
+                                &tab->output_capacity,
+                                &tab->output_length,
+                                "multiWatch: a monitoring session is already running.\n"
+                            );
+                        }
+                        else if (parse_multiwatch_commands(
+                                    command,
+                                    parsed_commands,
+                                    &parsed_count) != 0) {
+
+                            append_output(
+                                &tab->output,
+                                &tab->output_capacity,
+                                &tab->output_length,
+                                "Usage: multiWatch [\"cmd1\", \"cmd2\", ...]\n"
+                            );
+                        }
+                        else {
+                            multiwatch_session.command_count = parsed_count;
+
+                            for (int i = 0; i < parsed_count; i++) {
+                                snprintf(
+                                    multiwatch_session.commands[i],
+                                    sizeof(multiwatch_session.commands[i]),
+                                    "%s",
+                                    parsed_commands[i]
+                                );
+                            }
+
+                            multiwatch_session.running = 1;
+                            multiwatch_session.round_active = 0;
+                            multiwatch_session.next_refresh_time = time(NULL);
+
+                            append_output(
+                                &tab->output,
+                                &tab->output_capacity,
+                                &tab->output_length,
+                                "multiWatch: commands accepted; monitoring will start shortly.\n"
+                            );
+                        }
+
+                        tab->length = 0;
+                        tab->input[0] = '\0';
+                        tab->history_position = history_count;
+
+                        draw_input(
+                            display,
+                            window,
+                            gc,
+                            tab->input,
+                            tab->length,
+                            tab->output,
+                            tab->output_length
+                        );
+
+                        continue;
+                    }
                     int has_pipeline = find_pipeline_separator(command) != NULL;
+                    
                         
                     int background = 0;
                     int background_length = (int)strlen(command);
@@ -1360,6 +1846,24 @@ int main(void)
             draw_input(display, window, gc,
                        tab->input, tab->length,
                        tab->output, tab->output_length);
+        }
+        if (multiwatch_session.running) {
+            tab = &tabs[active_tab];
+            multiwatch_update(tab);
+
+            draw_input(
+                display,
+                window,
+                gc,
+                tab->input,
+                tab->length,
+                tab->output,
+                tab->output_length
+            );
+
+XFlush(display);
+        
+            XFlush(display);
         }
     }
 
