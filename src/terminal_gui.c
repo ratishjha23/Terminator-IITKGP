@@ -2,6 +2,7 @@
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
+#include <X11/Xatom.h>
 
 #include <errno.h>
 #include <signal.h>
@@ -82,6 +83,15 @@ int last_status = 0;
 int selection_start = -1;
 int selection_end = -1;
 int selecting_text = 0;
+
+
+/* X11 clipboard state. */
+Atom clipboard_atom;
+Atom utf8_string_atom;
+Atom targets_atom;
+char *clipboard_text = NULL;
+Atom paste_property_atom;
+
 
 #define MAX_JOBS 100
 
@@ -455,6 +465,38 @@ int input_position_from_x(Display *display, GC gc,
     XFreeFontInfo(NULL, font, 1);
     return position;
 }
+
+/* Insert clipboard text at the current input cursor. */
+void insert_clipboard_text(Tab *tab,
+                           const unsigned char *text,
+                           unsigned long text_length)
+{
+    for (unsigned long i = 0;
+         i < text_length && tab->length < INPUT_SIZE - 1;
+         i++) {
+
+        unsigned char c = text[i];
+
+        /* Keep pasted commands on the current input line. */
+        if (c == '\n' || c == '\r') {
+            continue;
+        }
+
+        /* Ignore control characters other than ordinary text. */
+        if (c < ' ' || c == 127) {
+            continue;
+        }
+
+        memmove(&tab->input[tab->cursor + 1],
+                &tab->input[tab->cursor],
+                (size_t)(tab->length - tab->cursor + 1));
+
+        tab->input[tab->cursor] = (char)c;
+        tab->cursor++;
+        tab->length++;
+    }
+}
+
 
 
 
@@ -908,6 +950,14 @@ int main(void)
         fprintf(stderr, "Cannot open X display.\n");
         return 1;
     }
+    
+    /* Initialize clipboard atoms used by X11. */
+    clipboard_atom = XInternAtom(display, "CLIPBOARD", False);
+    utf8_string_atom = XInternAtom(display, "UTF8_STRING", False);
+    targets_atom = XInternAtom(display, "TARGETS", False);
+    paste_property_atom =
+    XInternAtom(display, "TERMINATOR_PASTE", False);
+
 
     int screen = DefaultScreen(display);
 
@@ -1008,6 +1058,121 @@ int main(void)
                        tab->input, tab->length,
                        tab->output, tab->output_length);
         }
+        
+        else if (event.type == SelectionNotify) {
+            if (event.xselection.selection == clipboard_atom &&
+                event.xselection.target == utf8_string_atom &&
+                event.xselection.property != None) {
+
+                Atom actual_type;
+                int actual_format;
+                unsigned long item_count;
+                unsigned long bytes_after;
+                unsigned char *data = NULL;
+
+                int result = XGetWindowProperty(
+                    display,
+                    window,
+                    paste_property_atom,
+                    0,
+                    4096,
+                    True,
+                    AnyPropertyType,
+                    &actual_type,
+                    &actual_format,
+                    &item_count,
+                    &bytes_after,
+                    &data
+                );
+
+                if (result == Success &&
+                    data != NULL &&
+                    actual_format == 8 &&
+                    (actual_type == utf8_string_atom ||
+                    actual_type == XA_STRING)) {
+
+                    tab = &tabs[active_tab];
+
+                    insert_clipboard_text(tab, data, item_count);
+
+                    draw_input(display, window, gc,
+                            tab->input, tab->length,
+                            tab->output, tab->output_length);
+                }
+
+                if (data != NULL) {
+                    XFree(data);
+                }
+            }
+        }
+
+        
+        else if (event.type == SelectionRequest) {
+            XSelectionRequestEvent *request = &event.xselectionrequest;
+            XSelectionEvent response = {0};
+
+            response.type = SelectionNotify;
+            response.display = request->display;
+            response.requestor = request->requestor;
+            response.selection = request->selection;
+            response.target = request->target;
+            response.time = request->time;
+            response.property = None;
+
+            if (request->selection == clipboard_atom &&
+                clipboard_text != NULL) {
+
+                Atom property = request->property;
+
+                if (property == None) {
+                    property = request->target;
+                }
+
+                if (request->target == targets_atom) {
+                    Atom supported[] = {
+                        targets_atom,
+                        utf8_string_atom,
+                        XA_STRING
+                    };
+
+                    XChangeProperty(
+                        display,
+                        request->requestor,
+                        property,
+                        XA_ATOM,
+                        32,
+                        PropModeReplace,
+                        (unsigned char *)supported,
+                        3
+                    );
+
+                    response.property = property;
+                } else if (request->target == utf8_string_atom ||
+                        request->target == XA_STRING) {
+
+                    XChangeProperty(
+                        display,
+                        request->requestor,
+                        property,
+                        request->target,
+                        8,
+                        PropModeReplace,
+                        (unsigned char *)clipboard_text,
+                        (int)strlen(clipboard_text)
+                    );
+
+                    response.property = property;
+                }
+            }
+
+            XSendEvent(
+                display, request->requestor, False, 0,
+                (XEvent *)&response
+            );
+
+            XFlush(display);
+        }
+
 
         else if (event.type == ClientMessage) {
             if ((Atom)event.xclient.data.l[0] == wm_delete) {
@@ -1142,6 +1307,64 @@ int main(void)
                 &key,
                 NULL
             );
+            
+            /* Ctrl+Shift+V: request text from the X11 clipboard. */
+            if ((event.xkey.state & ControlMask) &&
+                (event.xkey.state & ShiftMask) &&
+                (key == XK_v || key == XK_V)) {
+
+                XConvertSelection(
+                    display,
+                    clipboard_atom,
+                    utf8_string_atom,
+                    paste_property_atom,
+                    window,
+                    CurrentTime
+                );
+
+                XFlush(display);
+                continue;
+            }
+
+            
+            /* Ctrl+Shift+C: copy selected input text. */
+            if ((event.xkey.state & ControlMask) &&
+                (event.xkey.state & ShiftMask) &&
+                (key == XK_c || key == XK_C)) {
+
+                int start = selection_start;
+                int end = selection_end;
+
+                if (start > end) {
+                    int temp = start;
+                    start = end;
+                    end = temp;
+                }
+
+                if (start >= 0 && end > start &&
+                    end <= tab->length) {
+
+                    size_t text_length = (size_t)(end - start);
+                    char *new_text = malloc(text_length + 1);
+
+                    if (new_text != NULL) {
+                        memcpy(new_text, tab->input + start, text_length);
+                        new_text[text_length] = '\0';
+
+                        free(clipboard_text);
+                        clipboard_text = new_text;
+
+                        XSetSelectionOwner(
+                            display, clipboard_atom, window, CurrentTime
+                        );
+
+                        XFlush(display);
+                    }
+                }
+
+                continue;
+            }
+
             /* Stop multiWatch when Ctrl+C is pressed. */
             if ((event.xkey.state & ControlMask) &&
                 (key == XK_c || key == XK_C)) {
