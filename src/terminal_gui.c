@@ -70,7 +70,7 @@ typedef struct {
 
     int history_position;
     int scroll_offset;
-
+    int cursor;
     char cwd[4096];
 } Tab;
 
@@ -237,7 +237,7 @@ int initialize_tab(int index)
     Tab *tab = &tabs[index];
     tab->input[0] = '\0';
     tab->length = 0;
-
+    tab->cursor = 0;
     tab->pending_input[0] = '\0';
     tab->pending_length = 0;
     tab->continuing = 0;
@@ -1040,6 +1040,7 @@ int main(void)
                         tab->pending_length = 0;
                         tab->continuing = 0;
                         tab->length = 0;
+                        tab->cursor = 0;
                         tab->input[0] = '\0';
                     }
                     else {
@@ -1073,6 +1074,7 @@ int main(void)
                         tab->pending_length = 0;
                         tab->continuing = 0;
                         tab->length = 0;
+                        tab->cursor = 0;
                         tab->input[0] = '\0';
 
                         draw_input(display, window, gc,
@@ -1109,6 +1111,7 @@ int main(void)
                                     "Terminator: command too long.\n");
 
                         tab->length = 0;
+                        tab->cursor = 0;
                         tab->input[0] = '\0';
                         tab->pending_length = 0;
                         tab->pending_input[0] = '\0';
@@ -1261,6 +1264,7 @@ int main(void)
                         }
 
                         tab->length = 0;
+                        tab->cursor = 0;
                         tab->input[0] = '\0';
                         tab->history_position = history_count;
 
@@ -1770,18 +1774,168 @@ int main(void)
                     }
 
                     tab->length = 0;
+                    tab->cursor = 0;
                     tab->input[0] = '\0';
                     tab->history_position = history_count;
                 }
             }
 
-            /* Backspace: delete one character. */
-            else if (key == XK_BackSpace || key == XK_Delete) {
-                if (tab->length > 0) {
-                    tab->length--;
-                    tab->input[tab->length] = '\0';
+            
+            /* Left arrow: move cursor left. */
+            else if (key == XK_Left) {
+                if (tab->cursor > 0) {
+                    tab->cursor--;
                 }
             }
+
+            /* Right arrow: move cursor right. */
+            else if (key == XK_Right) {
+                if (tab->cursor < tab->length) {
+                    tab->cursor++;
+                }
+            }
+
+            /* Ctrl+A: move cursor to the beginning. */
+            else if ((key == XK_a || key == XK_A) &&
+                    (event.xkey.state & ControlMask)) {
+                tab->cursor = 0;
+            }
+
+            /* Ctrl+E: move cursor to the end. */
+            else if ((key == XK_e || key == XK_E) &&
+                    (event.xkey.state & ControlMask)) {
+                tab->cursor = tab->length;
+            }
+
+            /* Backspace: delete the character before the cursor. */
+            else if (key == XK_BackSpace) {
+                if (tab->cursor > 0) {
+                    memmove(&tab->input[tab->cursor - 1],
+                            &tab->input[tab->cursor],
+                            (size_t)(tab->length - tab->cursor + 1));
+
+                    tab->cursor--;
+                    tab->length--;
+                }
+            }
+
+            /* Delete: delete the character at the cursor. */
+            else if (key == XK_Delete) {
+                if (tab->cursor < tab->length) {
+                    memmove(&tab->input[tab->cursor],
+                            &tab->input[tab->cursor + 1],
+                            (size_t)(tab->length - tab->cursor));
+                    tab->length--;
+                }
+            }
+
+            /* Up arrow: previous command in history. */
+            else if (key == XK_Up) {
+                if (tab->history_position > 0) {
+                    tab->history_position--;
+
+                    strcpy(tab->input, history[tab->history_position]);
+                    tab->length = (int)strlen(tab->input);
+                    tab->cursor = tab->length;
+                }
+            }
+
+            /* Down arrow: next command in history. */
+            else if (key == XK_Down) {
+                if (tab->history_position < history_count - 1) {
+                    tab->history_position++;
+
+                    strcpy(tab->input, history[tab->history_position]);
+                    tab->length = (int)strlen(tab->input);
+                    tab->cursor = tab->length;
+                } else {
+                    tab->history_position = history_count;
+                    tab->length = 0;
+                    tab->cursor = 0;
+                    tab->input[0] = '\0';
+                }
+            }
+            
+            /* Ctrl+U: delete from the beginning to the cursor. */
+            else if ((key == XK_u || key == XK_U) &&
+                    (event.xkey.state & ControlMask)) {
+                memmove(tab->input,
+                        &tab->input[tab->cursor],
+                        (size_t)(tab->length - tab->cursor + 1));
+
+                tab->length -= tab->cursor;
+                tab->cursor = 0;
+            }
+
+            /* Ctrl+K: delete from the cursor to the end. */
+            else if ((key == XK_k || key == XK_K) &&
+                    (event.xkey.state & ControlMask)) {
+                tab->length = tab->cursor;
+                tab->input[tab->length] = '\0';
+            }
+
+            /* Ctrl+W: delete the previous word. */
+            else if ((key == XK_w || key == XK_W) &&
+                    (event.xkey.state & ControlMask)) {
+                int start = tab->cursor;
+
+                /* Skip whitespace immediately before the cursor. */
+                while (start > 0 &&
+                    (tab->input[start - 1] == ' ' ||
+                        tab->input[start - 1] == '\t')) {
+                    start--;
+                }
+
+                /* Skip the previous word. */
+                while (start > 0 &&
+                    tab->input[start - 1] != ' ' &&
+                    tab->input[start - 1] != '\t') {
+                    start--;
+                }
+
+                memmove(&tab->input[start],
+                        &tab->input[tab->cursor],
+                        (size_t)(tab->length - tab->cursor + 1));
+
+                tab->length -= tab->cursor - start;
+                tab->cursor = start;
+            }
+
+
+            /* Ctrl+L: clear displayed output. */
+            else if ((key == XK_l || key == XK_L) &&
+                    (event.xkey.state & ControlMask)) {
+                tab->output_length = 0;
+                tab->output[0] = '\0';
+                tab->scroll_offset = 0;
+            }
+
+            /* Ctrl+D: exit when the input is empty. */
+            else if (key == XK_d &&
+                    (event.xkey.state & ControlMask) &&
+                    tab->length == 0) {
+                running = 0;
+            }
+
+
+            /* Insert ordinary typed characters at the cursor. */
+            else if (key_length > 0 &&
+                    !(event.xkey.state & ControlMask) &&
+                    tab->length + key_length < INPUT_SIZE) {
+                for (int i = 0; i < key_length; i++) {
+                    if (key_text[i] >= ' ' && key_text[i] != 127 &&
+                        tab->length < INPUT_SIZE - 1) {
+                        memmove(&tab->input[tab->cursor + 1],
+                                &tab->input[tab->cursor],
+                                (size_t)(tab->length - tab->cursor + 1));
+
+                        tab->input[tab->cursor] = key_text[i];
+                        tab->cursor++;
+                        tab->length++;
+                    }
+                }
+            }
+
 
             /* Up arrow: previous command. */
             else if (key == XK_Up) {
