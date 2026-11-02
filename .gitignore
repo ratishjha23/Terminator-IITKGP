@@ -32,3 +32,7 @@ x11_hello
 # Generated test output and data
 /dup2_output.txt
 /file.txt
+
+# Compiled test binaries
+tests/test_multiwatch
+tests/test_multiwatch_stop

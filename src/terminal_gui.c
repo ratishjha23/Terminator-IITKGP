@@ -15,6 +15,7 @@
 #include <fcntl.h>
 #include <time.h>
 #include <poll.h>
+#include <strings.h>
 
 #include "executor.h"
 #include "output_buffer.h"
@@ -39,6 +40,15 @@
 #define TAB_WIDTH 100
 
 #define MULTIWATCH_REFRESH_SECONDS 2
+typedef struct {
+    pid_t pid;
+    pid_t pgid;
+    int output_fd;
+    int job_index;
+    int active;
+    int stopped;
+    char command[INPUT_SIZE];
+} ForegroundProcess;
 
 typedef struct {
     int running;
@@ -73,6 +83,7 @@ typedef struct {
     int scroll_offset;
     int cursor;
     char cwd[4096];
+    ForegroundProcess foreground;
 } Tab;
 
 Tab tabs[MAX_TABS];
@@ -95,10 +106,321 @@ Atom paste_property_atom;
 
 #define MAX_JOBS 100
 
+/* --------------------------------------------------
+   CONFIGURABLE KEYBINDINGS
+   -------------------------------------------------- */
 
+typedef enum {
+    KEY_MOVE_LEFT,
+    KEY_MOVE_RIGHT,
+    KEY_LINE_START,
+    KEY_LINE_END,
+    KEY_HISTORY_UP,
+    KEY_HISTORY_DOWN,
+    KEY_DELETE_TO_START,
+    KEY_DELETE_TO_END,
+    KEY_DELETE_WORD,
+    KEY_CLEAR_SCREEN,
+    KEY_EXIT_SHELL,
+    KEY_COPY,
+    KEY_PASTE,
+    KEY_ACTION_COUNT
+} KeyAction;
+
+typedef struct {
+    KeySym key;
+    unsigned int modifiers;
+} KeyBinding;
+
+/* Default keybindings. */
+KeyBinding keybindings[KEY_ACTION_COUNT] = {
+    [KEY_MOVE_LEFT]       = {XK_Left, 0},
+    [KEY_MOVE_RIGHT]      = {XK_Right, 0},
+    [KEY_LINE_START]      = {XK_a, ControlMask},
+    [KEY_LINE_END]        = {XK_e, ControlMask},
+    [KEY_HISTORY_UP]      = {XK_Up, 0},
+    [KEY_HISTORY_DOWN]    = {XK_Down, 0},
+    [KEY_DELETE_TO_START] = {XK_u, ControlMask},
+    [KEY_DELETE_TO_END]   = {XK_k, ControlMask},
+    [KEY_DELETE_WORD]     = {XK_w, ControlMask},
+    [KEY_CLEAR_SCREEN]    = {XK_l, ControlMask},
+    [KEY_EXIT_SHELL]      = {XK_d, ControlMask},
+    [KEY_COPY]            = {XK_c, ControlMask | ShiftMask},
+    [KEY_PASTE]           = {XK_v, ControlMask | ShiftMask}
+};
+
+/* Names of actions used in ~/.terminatorrc. */
+const char *key_action_names[KEY_ACTION_COUNT] = {
+    "move_left",
+    "move_right",
+    "line_start",
+    "line_end",
+    "history_up",
+    "history_down",
+    "delete_to_start",
+    "delete_to_end",
+    "delete_word",
+    "clear_screen",
+    "exit_shell",
+    "copy",
+    "paste"
+};
+
+
+/* Remove spaces from the beginning and end of a string. */
+char *trim_whitespace(char *str)
+{
+    while (*str == ' ' || *str == '\t') {
+        str++;
+    }
+
+    char *end = str + strlen(str);
+
+    while (end > str &&
+           (end[-1] == ' ' || end[-1] == '\t' ||
+            end[-1] == '\r' || end[-1] == '\n')) {
+        end--;
+    }
+
+    *end = '\0';
+    return str;
+}
+
+
+/* Convert a shortcut such as Ctrl+Shift+C into a binding. */
+int parse_key_binding(const char *value, KeyBinding *binding)
+{
+    char copy[128];
+
+    if (strlen(value) >= sizeof(copy)) {
+        return 0;
+    }
+
+    strcpy(copy, value);
+
+    unsigned int modifiers = 0;
+    char *key_name = NULL;
+    char *saveptr = NULL;
+
+    char *token = strtok_r(copy, "+", &saveptr);
+
+    while (token != NULL) {
+        token = trim_whitespace(token);
+
+        if (strcasecmp(token, "Ctrl") == 0 ||
+            strcasecmp(token, "Control") == 0) {
+            modifiers |= ControlMask;
+        }
+        else if (strcasecmp(token, "Shift") == 0) {
+            modifiers |= ShiftMask;
+        }
+        else if (strcasecmp(token, "Alt") == 0) {
+            modifiers |= Mod1Mask;
+        }
+        else {
+            if (key_name != NULL) {
+                return 0;
+            }
+
+            key_name = token;
+        }
+
+        token = strtok_r(NULL, "+", &saveptr);
+    }
+
+    if (key_name == NULL || key_name[0] == '\0') {
+        return 0;
+    }
+
+    /* Normalize single alphabetic keys to lowercase. */
+    if (strlen(key_name) == 1 &&
+        key_name[0] >= 'A' && key_name[0] <= 'Z') {
+        key_name[0] = (char)(key_name[0] - 'A' + 'a');
+    }
+
+    KeySym key = XStringToKeysym(key_name);
+
+    if (key == NoSymbol) {
+        return 0;
+    }
+
+    binding->key = key;
+    binding->modifiers = modifiers;
+
+    return 1;
+}
+
+
+/* Find an action using its name from the configuration file. */
+int find_key_action(const char *name)
+{
+    for (int i = 0; i < KEY_ACTION_COUNT; i++) {
+        if (strcmp(name, key_action_names[i]) == 0) {
+            return i;
+        }
+    }
+
+    return -1;
+}
+
+
+/* Check whether another action already uses this shortcut. */
+int key_binding_conflicts(int action, KeyBinding binding)
+{
+    for (int i = 0; i < KEY_ACTION_COUNT; i++) {
+        if (i == action) {
+            continue;
+        }
+
+        if (keybindings[i].key == binding.key &&
+            keybindings[i].modifiers == binding.modifiers) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+
+/* Create the default configuration file on first launch. */
+void create_default_keybinding_config(const char *path)
+{
+    FILE *file = fopen(path, "w");
+
+    if (file == NULL) {
+        perror("Could not create ~/.terminatorrc");
+        return;
+    }
+
+    fprintf(file, "# Terminator keyboard shortcuts\n");
+    fprintf(file, "[Keybindings]\n");
+
+    fprintf(file, "move_left = Left\n");
+    fprintf(file, "move_right = Right\n");
+    fprintf(file, "line_start = Ctrl+A\n");
+    fprintf(file, "line_end = Ctrl+E\n");
+    fprintf(file, "history_up = Up\n");
+    fprintf(file, "history_down = Down\n");
+    fprintf(file, "delete_to_start = Ctrl+U\n");
+    fprintf(file, "delete_to_end = Ctrl+K\n");
+    fprintf(file, "delete_word = Ctrl+W\n");
+    fprintf(file, "clear_screen = Ctrl+L\n");
+    fprintf(file, "exit_shell = Ctrl+D\n");
+    fprintf(file, "copy = Ctrl+Shift+C\n");
+    fprintf(file, "paste = Ctrl+Shift+V\n");
+
+    fclose(file);
+}
+
+
+/* Load keyboard shortcuts from ~/.terminatorrc. */
+void load_keybindings(void)
+{
+    const char *home = getenv("HOME");
+
+    if (home == NULL) {
+        fprintf(stderr, "HOME environment variable not found.\n");
+        return;
+    }
+
+    char path[4096];
+
+    snprintf(path, sizeof(path), "%s/.terminatorrc", home);
+
+    FILE *file = fopen(path, "r");
+
+    if (file == NULL) {
+        create_default_keybinding_config(path);
+        return;
+    }
+
+    char line[256];
+    int line_number = 0;
+
+    while (fgets(line, sizeof(line), file) != NULL) {
+        line_number++;
+
+        char *text = trim_whitespace(line);
+
+        /* Ignore blank lines and comments. */
+        if (*text == '\0' || *text == '#' || *text == ';') {
+            continue;
+        }
+
+        /* Ignore section headers. */
+        if (*text == '[') {
+            continue;
+        }
+
+        char *equals = strchr(text, '=');
+
+        if (equals == NULL) {
+            fprintf(stderr,
+                    "Invalid keybinding at line %d.\n",
+                    line_number);
+            continue;
+        }
+
+        *equals = '\0';
+
+        char *action_name = trim_whitespace(text);
+        char *value = trim_whitespace(equals + 1);
+
+        int action = find_key_action(action_name);
+
+        if (action == -1) {
+            fprintf(stderr,
+                    "Unknown keybinding action: %s\n",
+                    action_name);
+            continue;
+        }
+
+        KeyBinding new_binding;
+
+        if (!parse_key_binding(value, &new_binding)) {
+            fprintf(stderr,
+                    "Invalid shortcut for %s: %s\n",
+                    action_name, value);
+            continue;
+        }
+
+        if (key_binding_conflicts(action, new_binding)) {
+            fprintf(stderr,
+                    "Conflicting shortcut for %s: %s\n",
+                    action_name, value);
+            continue;
+        }
+
+        keybindings[action] = new_binding;
+    }
+
+    fclose(file);
+
+    printf("Keybindings loaded from %s\n", path);
+}
+
+/* Check whether a pressed key matches a configured shortcut. */
+int key_matches(KeyAction action, KeySym key,
+                unsigned int state)
+{
+    unsigned int modifiers = state &
+        (ControlMask | ShiftMask | Mod1Mask);
+
+    KeySym pressed_key = key;
+
+    /* Treat uppercase and lowercase letters as the same key. */
+    if (pressed_key >= XK_A && pressed_key <= XK_Z) {
+        pressed_key = pressed_key - XK_A + XK_a;
+    }
+
+    return pressed_key == keybindings[action].key &&
+           modifiers == keybindings[action].modifiers;
+}
 typedef struct {
     pid_t pid;
     pid_t pgid;
+    int output_fd;
+    int tab_index;
     char command[INPUT_SIZE];
     int running;
     int stopped;
@@ -255,6 +577,14 @@ int initialize_tab(int index)
     tab->pending_input[0] = '\0';
     tab->pending_length = 0;
     tab->continuing = 0;
+
+    tab->foreground.pid = -1;
+    tab->foreground.pgid = -1;
+    tab->foreground.output_fd = -1;
+    tab->foreground.active = 0;
+    tab->foreground.stopped = 0;
+    tab->foreground.job_index = -1;
+    tab->foreground.command[0] = '\0';
 
     tab->output_capacity = 4096;
     tab->output_length = 0;
@@ -508,9 +838,11 @@ int run_background(
     const char *output_file
 )
 {
+    
     if (job_count >= MAX_JOBS) {
         return -1;
     }
+    jobs[job_count].tab_index = -1;
 
     pid_t pid = fork();
 
@@ -578,6 +910,7 @@ int run_background(
 
     jobs[job_count].pid = pid;
     jobs[job_count].pgid = pid;
+    jobs[job_count].output_fd = -1;
 
     snprintf(
         jobs[job_count].command,
@@ -591,6 +924,275 @@ int run_background(
     job_count++;
 
     return (int)pid;
+}
+
+int run_foreground_async(
+    Tab *tab,
+    char *args[],
+    const char *command,
+    const char *input_file,
+    const char *output_file
+)
+{
+    int pipefd[2];
+
+    if (pipe(pipefd) == -1) {
+        perror("pipe");
+        return -1;
+    }
+
+    pid_t pid = fork();
+
+    if (pid == -1) {
+        perror("fork");
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return -1;
+    }
+
+    if (pid == 0) {
+        close(pipefd[0]);
+
+        /* Create a separate process group. */
+        if (setpgid(0, 0) == -1) {
+            perror("setpgid");
+            _exit(1);
+        }
+
+        /* Redirect standard error to the output pipe. */
+        if (dup2(pipefd[1], STDERR_FILENO) == -1) {
+            perror("dup2 stderr");
+            _exit(1);
+        }
+
+        if (output_file != NULL) {
+            int fd = open(
+                output_file,
+                O_WRONLY | O_CREAT | O_TRUNC,
+                0666
+            );
+
+            if (fd == -1) {
+                perror(output_file);
+                _exit(1);
+            }
+
+            if (dup2(fd, STDOUT_FILENO) == -1) {
+                perror("dup2 stdout");
+                close(fd);
+                _exit(1);
+            }
+
+            close(fd);
+        }
+        else {
+            if (dup2(pipefd[1], STDOUT_FILENO) == -1) {
+                perror("dup2 stdout");
+                _exit(1);
+            }
+        }
+
+        close(pipefd[1]);
+
+        if (input_file != NULL) {
+            int fd = open(input_file, O_RDONLY);
+
+            if (fd == -1) {
+                perror(input_file);
+                _exit(1);
+            }
+
+            if (dup2(fd, STDIN_FILENO) == -1) {
+                perror("dup2 stdin");
+                close(fd);
+                _exit(1);
+            }
+
+            close(fd);
+        }
+
+        execvp(args[0], args);
+
+        perror(args[0]);
+        _exit(127);
+    }
+
+    close(pipefd[1]);
+
+    /* Parent also assigns the process group. */
+    if (setpgid(pid, pid) == -1 && errno != EACCES && errno != ESRCH) {
+        perror("setpgid");
+    }
+
+    /* Make the read end nonblocking. */
+    int flags = fcntl(pipefd[0], F_GETFL, 0);
+
+    if (flags == -1 ||
+        fcntl(pipefd[0], F_SETFL, flags | O_NONBLOCK) == -1) {
+        perror("fcntl");
+        kill(-pid, SIGKILL);
+        close(pipefd[0]);
+        waitpid(pid, NULL, 0);
+        return -1;
+    }
+
+    tab->foreground.pid = pid;
+    tab->foreground.pgid = pid;
+    tab->foreground.output_fd = pipefd[0];
+    tab->foreground.active = 1;
+    tab->foreground.job_index = -1;
+    tab->foreground.stopped = 0;
+
+    snprintf(
+        tab->foreground.command,
+        sizeof(tab->foreground.command),
+        "%s",
+        command
+    );
+
+    return 0;
+}
+
+
+void update_foreground_output(Tab *tab)
+{
+    if (tab == NULL) {
+        return;
+    }
+    if (tab->foreground.output_fd != -1){
+
+        char buffer[4097];
+
+        while (1) {
+            ssize_t bytes_read = read(
+                tab->foreground.output_fd,
+                buffer,
+                sizeof(buffer)-1
+            );
+
+            if (bytes_read > 0) {
+                buffer[bytes_read] = '\0';
+                int old_length = tab->output_length;
+
+                if (append_output(
+                        &tab->output,
+                        &tab->output_capacity,
+                        &tab->output_length,
+                        buffer) == -1) {
+                    fprintf(stderr, "Error storing command output.\n");
+                    break;
+                }
+
+                if (tab->output_length > old_length) {
+                    tab->scroll_offset = 0;
+                }
+            }
+            else if (bytes_read == 0) {
+                close(tab->foreground.output_fd);
+                tab->foreground.output_fd = -1;
+                break;
+            }
+            else {
+                if (errno == EINTR) {
+                    continue;
+                }
+
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    break;
+                }
+
+                perror("read foreground output");
+                close(tab->foreground.output_fd);
+                tab->foreground.output_fd = -1;
+                break;
+            }
+        }
+    }
+
+    if (tab->foreground.active) {
+        int status;
+        pid_t result = waitpid(
+            tab->foreground.pid,
+            &status,
+            WNOHANG | WUNTRACED | WCONTINUED
+        );
+
+        if (result == tab->foreground.pid) {
+            if (WIFSTOPPED(status)) {
+                tab->foreground.stopped = 1;
+            }
+            else if (WIFCONTINUED(status)) {
+                tab->foreground.stopped = 0;
+            }
+            else if (WIFEXITED(status) || WIFSIGNALED(status)) {
+                tab->foreground.active = 0;
+
+                if (WIFEXITED(status)) {
+                    last_status = WEXITSTATUS(status);
+                }
+                else {
+                    last_status = 128 + WTERMSIG(status);
+                }
+            }
+        }
+    }
+}
+void update_job_output(Job *job)
+{
+    if (job == NULL || job->output_fd == -1) {
+        return;
+    }
+
+    if (job->tab_index < 0 || job->tab_index >= tab_count) {
+        close(job->output_fd);
+        job->output_fd = -1;
+        return;
+    }
+
+    Tab *tab = &tabs[job->tab_index];
+    char buffer[4097];
+
+    while (1) {
+        ssize_t bytes_read = read(
+            job->output_fd,
+            buffer,
+            sizeof(buffer) - 1
+        );
+
+        if (bytes_read > 0) {
+            buffer[bytes_read] = '\0';
+
+            if (append_output(
+                    &tab->output,
+                    &tab->output_capacity,
+                    &tab->output_length,
+                    buffer) == -1) {
+                fprintf(stderr, "Error storing background job output.\n");
+                break;
+            }
+
+            tab->scroll_offset = 0;
+        }
+        else if (bytes_read == 0) {
+            close(job->output_fd);
+            job->output_fd = -1;
+            break;
+        }
+        else {
+            if (errno == EINTR) {
+                continue;
+            }
+
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                break;
+            }
+
+            perror("read job output");
+            close(job->output_fd);
+            job->output_fd = -1;
+            break;
+        }
+    }
 }
 
 void update_job_status(void)
@@ -944,6 +1546,8 @@ static void multiwatch_update(Tab *tab)
 }
 int main(void)
 {
+    /* Load user-configured keyboard shortcuts. */
+    load_keybindings();
     Display *display = XOpenDisplay(NULL);
 
     if (display == NULL) {
@@ -1006,44 +1610,110 @@ int main(void)
     int running = 1;
 
     while (running) {
-        if (multiwatch_session.running) {
-            struct pollfd x_event_fd;
-    
-            x_event_fd.fd = ConnectionNumber(display);
-            x_event_fd.events = POLLIN;
-            x_event_fd.revents = 0;
-    
-            /*
-             * Wait briefly for X11 events instead of busy-waiting.
-             * This gives multiWatch regular opportunities to read output.
-             */
-            int ready = poll(&x_event_fd, 1, 100);
-    
-            if (ready == -1 && errno != EINTR) {
-                perror("poll: X11 event loop");
+        /* Poll X11 and all foreground command output pipes. */
+        if (XPending(display) == 0) {
+            struct pollfd poll_fds[MAX_TABS + MAX_JOBS + 1];
+            int fd_tabs[MAX_TABS + MAX_JOBS + 1];
+            int fd_jobs[MAX_TABS + MAX_JOBS + 1];
+            int fd_count = 1;
+
+            poll_fds[0].fd = ConnectionNumber(display);
+            poll_fds[0].events = POLLIN;
+            poll_fds[0].revents = 0;
+            fd_tabs[0] = -1;
+            fd_jobs[0] = -1;
+            for (int i = 0; i < tab_count; i++) {
+                if (tabs[i].foreground.output_fd != -1) {
+                    poll_fds[fd_count].fd =
+                        tabs[i].foreground.output_fd;
+
+                    poll_fds[fd_count].events = POLLIN;
+                    poll_fds[fd_count].revents = 0;
+                    fd_tabs[fd_count] = i;
+                    fd_jobs[fd_count] = -1;
+
+                    fd_count++;
+                }
+            }
+            /* Add output pipes belonging to suspended/resumed jobs. */
+            for (int i = 0; i < job_count; i++) {
+                if (jobs[i].output_fd != -1) {
+                    poll_fds[fd_count].fd = jobs[i].output_fd;
+                    poll_fds[fd_count].events = POLLIN;
+                    poll_fds[fd_count].revents = 0;
+
+                    fd_tabs[fd_count] = -1;
+                    fd_jobs[fd_count] = i;
+
+                    fd_count++;
+                }
+            }
+
+            int has_foreground_process = 0;
+
+            for (int i = 0; i < tab_count; i++) {
+                if (tabs[i].foreground.active) {
+                    has_foreground_process = 1;
+                    break;
+                }
+            }
+
+            int timeout = (multiwatch_session.running ||
+                        has_foreground_process) ? 100 : -1;
+
+            int ready = poll(poll_fds, fd_count, timeout);
+
+            if (ready == -1) {
+                if (errno == EINTR) {
+                    continue;
+                }
+
+                perror("poll: event loop");
                 running = 0;
                 break;
             }
-    
-            if (XPending(display) == 0) {
-                /*
-                 * No X11 event is waiting. Update the active tab's
-                 * multiWatch output, then redraw it.
-                 */
-                 tab = &tabs[active_tab];
 
-                 multiwatch_update(tab);
-                 
-                 draw_input(
-                     display,
-                     window,
-                     gc,
-                     tab->input,
-                     tab->length,
-                     tab->output,
-                     tab->output_length
-                 );
-    
+            /* Read output from whichever foreground pipes are ready. */
+            for (int i = 1; i < fd_count; i++) {
+                if (poll_fds[i].revents & (POLLIN | POLLHUP | POLLERR)) {
+                    int index = fd_tabs[i];
+
+                    if (fd_jobs[i] >= 0 && fd_jobs[i] < job_count) {
+                        update_job_output(&jobs[fd_jobs[i]]);
+                    }
+                    else if (index >= 0 && index < tab_count) {
+                        update_foreground_output(&tabs[index]);
+                    }
+                }
+            }
+            /* Recheck foreground processes whose output pipes are closed. */
+            for (int i = 0; i < tab_count; i++) {
+                if (tabs[i].foreground.active &&
+                    tabs[i].foreground.output_fd == -1) {
+
+                    update_foreground_output(&tabs[i]);
+                }
+            }
+
+            /* Update multiWatch even when no keyboard event arrives. */
+            if (multiwatch_session.running) {
+                multiwatch_update(&tabs[active_tab]);
+            }
+
+            /* If no X11 event is waiting, redraw and poll again. */
+            if (XPending(display) == 0) {
+                tab = &tabs[active_tab];
+
+                draw_input(
+                    display,
+                    window,
+                    gc,
+                    tab->input,
+                    tab->length,
+                    tab->output,
+                    tab->output_length
+                );
+
                 XFlush(display);
                 continue;
             }
@@ -1308,10 +1978,8 @@ int main(void)
                 NULL
             );
             
-            /* Ctrl+Shift+V: request text from the X11 clipboard. */
-            if ((event.xkey.state & ControlMask) &&
-                (event.xkey.state & ShiftMask) &&
-                (key == XK_v || key == XK_V)) {
+            /* Configurable paste shortcut. */
+            if (key_matches(KEY_PASTE, key, event.xkey.state)) {
 
                 XConvertSelection(
                     display,
@@ -1327,10 +1995,8 @@ int main(void)
             }
 
             
-            /* Ctrl+Shift+C: copy selected input text. */
-            if ((event.xkey.state & ControlMask) &&
-                (event.xkey.state & ShiftMask) &&
-                (key == XK_c || key == XK_C)) {
+            /* Configurable copy shortcut. */
+            if (key_matches(KEY_COPY, key, event.xkey.state)) {
 
                 int start = selection_start;
                 int end = selection_end;
@@ -1364,12 +2030,143 @@ int main(void)
 
                 continue;
             }
+            /* Handle Ctrl+Z: suspend the foreground command. */
+            if ((event.xkey.state & ControlMask) &&
+                (key == XK_z || key == XK_Z)) {
 
-            /* Stop multiWatch when Ctrl+C is pressed. */
+                if (tab->foreground.active &&
+                    !tab->foreground.stopped &&
+                    tab->foreground.pgid > 0) {
+
+                    if (tab->foreground.job_index == -1 &&
+                            job_count >= MAX_JOBS)  {
+                        append_output(
+                            &tab->output,
+                            &tab->output_capacity,
+                            &tab->output_length,
+                            "Cannot suspend: job table is full.\n"
+                        );
+                    }
+                    else if (kill(-tab->foreground.pgid, SIGTSTP) == -1) {
+                        perror("Ctrl+Z: SIGTSTP");
+                    }
+                    else {
+                        int status;
+                        pid_t result;
+
+                        do {
+                            result = waitpid(
+                                tab->foreground.pid,
+                                &status,
+                                WUNTRACED
+                            );
+                        } while (result == -1 && errno == EINTR);
+
+                        if (result == tab->foreground.pid &&
+                            WIFSTOPPED(status)) {
+                            int job_index = tab->foreground.job_index;
+
+                            /* Create a new job only if this process has no previous job entry. */
+                            if (job_index == -1) {
+                                job_index = job_count;
+                                job_count++;
+                            }
+                            
+                            int job_number = job_index + 1;
+                            
+                            jobs[job_index].pid = tab->foreground.pid;
+                            jobs[job_index].pgid = tab->foreground.pgid;
+                            jobs[job_index].output_fd = tab->foreground.output_fd;
+                            jobs[job_index].tab_index = active_tab;
+                            
+                            snprintf(
+                                jobs[job_index].command,
+                                sizeof(jobs[job_index].command),
+                                "%s",
+                                tab->foreground.command
+                            );
+                            
+                            jobs[job_index].running = 1;
+                            jobs[job_index].stopped = 1;
+
+                            char message[INPUT_SIZE + 100];
+
+                            snprintf(
+                                message,
+                                sizeof(message),
+                                "\n^Z\n[%d]+ Stopped %s\n",
+                                job_number,
+                                tab->foreground.command
+                            );
+
+                            append_output(
+                                &tab->output,
+                                &tab->output_capacity,
+                                &tab->output_length,
+                                message
+                            );
+
+                            /* Release the foreground process slot. */
+                            tab->foreground.pid = -1;
+                            tab->foreground.pgid = -1;
+                            tab->foreground.output_fd = -1;
+                            tab->foreground.active = 0;
+                            tab->foreground.stopped = 0;
+                            tab->foreground.job_index = -1;
+                            tab->foreground.command[0] = '\0';
+
+                            tab->scroll_offset = 0;
+                        }
+                        else {
+                            append_output(
+                                &tab->output,
+                                &tab->output_capacity,
+                                &tab->output_length,
+                                "Error: could not suspend foreground command.\n"
+                            );
+                        }
+                    }
+                }
+
+                draw_input(
+                    display,
+                    window,
+                    gc,
+                    tab->input,
+                    tab->length,
+                    tab->output,
+                    tab->output_length
+                );
+
+                XFlush(display);
+                continue;
+            }
+
+            /* Handle Ctrl+C. */
             if ((event.xkey.state & ControlMask) &&
                 (key == XK_c || key == XK_C)) {
 
+                /* Stop the foreground command, if one is running. */
+                if (tab->foreground.active &&
+                    !tab->foreground.stopped &&
+                    tab->foreground.pgid > 0) {
+
+                    if (kill(-tab->foreground.pgid, SIGINT) == 0) {
+
+                        append_output(
+                            &tab->output,
+                            &tab->output_capacity,
+                            &tab->output_length,
+                            "\n^C\n"
+                        );
+
+                        tab->scroll_offset = 0;
+                    }
+                }
+
+                /* Preserve the existing MultiWatch behaviour. */
                 if (multiwatch_session.running) {
+
                     multiwatch_stop(
                         multiwatch_session.processes,
                         multiwatch_session.command_count
@@ -1383,11 +2180,37 @@ int main(void)
                         &tab->output,
                         &tab->output_capacity,
                         &tab->output_length,
-                        "\n^C\nmultiWatch stopped.\n"
+                        "\nmultiWatch stopped.\n"
                     );
 
                     tab->scroll_offset = 0;
+                }
 
+                draw_input(
+                    display,
+                    window,
+                    gc,
+                    tab->input,
+                    tab->length,
+                    tab->output,
+                    tab->output_length
+                );
+
+                XFlush(display);
+
+                continue;
+            }
+
+            /* Enter: execute the command. */
+            if (key == XK_Return || key == XK_KP_Enter) {
+                if (tab->foreground.active) {
+                    append_output(
+                        &tab->output,
+                        &tab->output_capacity,
+                        &tab->output_length,
+                        "A foreground command is already running.\n"
+                    );
+                
                     draw_input(
                         display,
                         window,
@@ -1397,15 +2220,9 @@ int main(void)
                         tab->output,
                         tab->output_length
                     );
-
-                    XFlush(display);
+                
+                    continue;
                 }
-
-                continue;
-            }
-
-            /* Enter: execute the command. */
-            if (key == XK_Return || key == XK_KP_Enter) {
                 
                 /* Handle multiline commands before normal execution. */
                 if (tab->length > 0) {
@@ -1583,25 +2400,27 @@ int main(void)
                     }
 
                     command[command_length] = '\0';
-                    /* Display and store the original multiWatch command. */
-                    history_add(tab->input);
-                    tab->history_position = history_count;
-
-                    char multiwatch_command_line[INPUT_SIZE + 20];
-
-                    snprintf(multiwatch_command_line,
-                            sizeof(multiwatch_command_line),
-                            "Terminator> %s\n", tab->input);
-
-                    append_output(&tab->output,
-                                &tab->output_capacity,
-                                &tab->output_length,
-                                multiwatch_command_line);
+                    
                                                         
                     /* Handle the multiWatch command before normal command parsing. */
                     if (strncmp(command, "multiWatch", 10) == 0 &&
                         (command[10] == ' ' || command[10] == '\t' ||
                         command[10] == '[')) {
+
+                            /* Display and store the original multiWatch command. */
+                            history_add(tab->input);
+                            tab->history_position = history_count;
+                            
+                            char multiwatch_command_line[INPUT_SIZE + 20];
+                            
+                            snprintf(multiwatch_command_line,
+                                     sizeof(multiwatch_command_line),
+                                     "Terminator> %s\n", tab->input);
+                            
+                            append_output(&tab->output,
+                                          &tab->output_capacity,
+                                          &tab->output_length,
+                                          multiwatch_command_line);
 
                         int parsed_count = 0;
 
@@ -2013,11 +2832,15 @@ int main(void)
                             
                             else if (strcmp(args[0], "bg") == 0) {
                                 int job_number = job_count;
-
+                            
                                 if (args[1] != NULL) {
-                                    job_number = atoi(args[1]);
+                                    if (args[1][0] == '%') {
+                                        job_number = atoi(args[1] + 1);
+                                    } else {
+                                        job_number = atoi(args[1]);
+                                    }
                                 }
-
+                            
                                 int index = find_job(job_number);
 
                                 if (index == -1 || !jobs[index].running) {
@@ -2045,57 +2868,69 @@ int main(void)
                                     last_status = 0;
                                 }
                             }
-                            
                             else if (strcmp(args[0], "fg") == 0) {
-                                int job_number = job_count;
 
+                                update_job_status();
+                            
+                                int job_number = job_count;
+                            
                                 if (args[1] != NULL) {
                                     job_number = atoi(args[1]);
                                 }
-
+                            
                                 int index = find_job(job_number);
-
+                            
                                 if (index == -1 || !jobs[index].running) {
-                                    append_output(&tab->output,
-                                                &tab->output_capacity,
-                                                &tab->output_length,
-                                                "fg: invalid or finished job\n");
+                            
+                                    append_output(
+                                        &tab->output,
+                                        &tab->output_capacity,
+                                        &tab->output_length,
+                                        "fg: invalid or finished job\n"
+                                    );
+                            
                                     last_status = 1;
-                                } else {
-                                    if (kill(-jobs[index].pgid, SIGCONT) == -1) {
-                                        perror("fg: SIGCONT");
-                                        last_status = 1;
-                                    } else {
-                                        jobs[index].stopped = 0;
-
-                                        int status;
-                                        pid_t result;
-
-                                        do {
-                                            result = waitpid(jobs[index].pid,
-                                                            &status,
-                                                            WUNTRACED);
-                                        } while (result == -1 && errno == EINTR);
-
-                                        if (result == -1) {
-                                            perror("fg: waitpid");
-                                            last_status = 1;
-                                        } else if (WIFSTOPPED(status)) {
-                                            jobs[index].stopped = 1;
-                                            last_status = 128 + WSTOPSIG(status);
-                                        } else {
-                                            jobs[index].running = 0;
-                                            jobs[index].stopped = 0;
-
-                                            if (WIFEXITED(status)) {
-                                                last_status = WEXITSTATUS(status);
-                                            } else if (WIFSIGNALED(status)) {
-                                                last_status = 128 + WTERMSIG(status);
-                                            } else {
-                                                last_status = 1;
-                                            }
-                                        }
-                                    }
+                                }
+                                else if (tab->foreground.active ||
+                                         tab->foreground.output_fd != -1) {
+                            
+                                    append_output(
+                                        &tab->output,
+                                        &tab->output_capacity,
+                                        &tab->output_length,
+                                        "fg: another foreground command is active\n"
+                                    );
+                            
+                                    last_status = 1;
+                                }
+                                else if (kill(-jobs[index].pgid, SIGCONT) == -1) {
+                            
+                                    perror("fg: SIGCONT");
+                                    last_status = 1;
+                                }
+                                else {
+                            
+                                    /* Transfer the job back to the foreground tab. */
+                                    tab->foreground.pid = jobs[index].pid;
+                                    tab->foreground.pgid = jobs[index].pgid;
+                                    tab->foreground.output_fd = jobs[index].output_fd;
+                                    tab->foreground.active = 1;
+                                    tab->foreground.stopped = 0;
+                                    tab->foreground.job_index = index;
+                            
+                                    snprintf(
+                                        tab->foreground.command,
+                                        sizeof(tab->foreground.command),
+                                        "%s",
+                                        jobs[index].command
+                                    );
+                            
+                                    /* The job is now managed as a foreground process. */
+                                    jobs[index].output_fd = -1;
+                                    jobs[index].running = 0;
+                                    jobs[index].stopped = 0;
+                            
+                                    last_status = 0;
                                 }
                             }
 
@@ -2137,24 +2972,26 @@ int main(void)
                                     }
                                 }
                                 else {
-                                    last_status = run_command_redirected(
+                                    int result = run_foreground_async(
+                                        tab,
                                         args,
+                                        tab->input,
                                         input_file[0] != '\0' ? input_file : NULL,
-                                        output_file[0] != '\0' ? output_file : NULL,
-                                        &tab->output,
-                                        &tab->output_capacity,
-                                        &tab->output_length
+                                        output_file[0] != '\0' ? output_file : NULL
                                     );
-
-                                    if (last_status == -1) {
+                                
+                                    if (result == -1) {
                                         append_output(
                                             &tab->output,
                                             &tab->output_capacity,
                                             &tab->output_length,
-                                            "Error executing command.\n"
+                                            "Error starting foreground command.\n"
                                         );
-
+                                
                                         last_status = 1;
+                                    }
+                                    else {
+                                        last_status = 0;
                                     }
                                 }
                             }
@@ -2169,29 +3006,27 @@ int main(void)
             }
 
             
-            /* Left arrow: move cursor left. */
-            else if (key == XK_Left) {
+            /* Move cursor left. */
+            else if (key_matches(KEY_MOVE_LEFT, key, event.xkey.state)) {
                 if (tab->cursor > 0) {
                     tab->cursor--;
                 }
             }
 
-            /* Right arrow: move cursor right. */
-            else if (key == XK_Right) {
+            /* Move cursor right. */
+            else if (key_matches(KEY_MOVE_RIGHT, key, event.xkey.state)) {
                 if (tab->cursor < tab->length) {
                     tab->cursor++;
                 }
             }
 
-            /* Ctrl+A: move cursor to the beginning. */
-            else if ((key == XK_a || key == XK_A) &&
-                    (event.xkey.state & ControlMask)) {
+            /* Move cursor to beginning of input. */
+            else if (key_matches(KEY_LINE_START, key, event.xkey.state)) {
                 tab->cursor = 0;
             }
 
-            /* Ctrl+E: move cursor to the end. */
-            else if ((key == XK_e || key == XK_E) &&
-                    (event.xkey.state & ControlMask)) {
+            /* Move cursor to end of input. */
+            else if (key_matches(KEY_LINE_END, key, event.xkey.state)) {
                 tab->cursor = tab->length;
             }
 
@@ -2217,8 +3052,8 @@ int main(void)
                 }
             }
 
-            /* Up arrow: previous command in history. */
-            else if (key == XK_Up) {
+            /* Previous command in history. */
+            else if (key_matches(KEY_HISTORY_UP, key, event.xkey.state)) {
                 if (tab->history_position > 0) {
                     tab->history_position--;
 
@@ -2228,8 +3063,8 @@ int main(void)
                 }
             }
 
-            /* Down arrow: next command in history. */
-            else if (key == XK_Down) {
+            /* Next command in history. */
+            else if (key_matches(KEY_HISTORY_DOWN, key, event.xkey.state)) {
                 if (tab->history_position < history_count - 1) {
                     tab->history_position++;
 
@@ -2245,8 +3080,7 @@ int main(void)
             }
             
             /* Ctrl+U: delete from the beginning to the cursor. */
-            else if ((key == XK_u || key == XK_U) &&
-                    (event.xkey.state & ControlMask)) {
+            else if (key_matches(KEY_DELETE_TO_START, key, event.xkey.state)) {
                 memmove(tab->input,
                         &tab->input[tab->cursor],
                         (size_t)(tab->length - tab->cursor + 1));
@@ -2256,15 +3090,13 @@ int main(void)
             }
 
             /* Ctrl+K: delete from the cursor to the end. */
-            else if ((key == XK_k || key == XK_K) &&
-                    (event.xkey.state & ControlMask)) {
+            else if (key_matches(KEY_DELETE_TO_END, key, event.xkey.state)) {
                 tab->length = tab->cursor;
                 tab->input[tab->length] = '\0';
             }
 
             /* Ctrl+W: delete the previous word. */
-            else if ((key == XK_w || key == XK_W) &&
-                    (event.xkey.state & ControlMask)) {
+            else if (key_matches(KEY_DELETE_WORD, key, event.xkey.state)) {
                 int start = tab->cursor;
 
                 /* Skip whitespace immediately before the cursor. */
@@ -2290,17 +3122,15 @@ int main(void)
             }
 
 
-            /* Ctrl+L: clear displayed output. */
-            else if ((key == XK_l || key == XK_L) &&
-                    (event.xkey.state & ControlMask)) {
+            /* Clear displayed output. */
+            else if (key_matches(KEY_CLEAR_SCREEN, key, event.xkey.state)) {
                 tab->output_length = 0;
                 tab->output[0] = '\0';
                 tab->scroll_offset = 0;
             }
 
-            /* Ctrl+D: exit when the input is empty. */
-            else if (key == XK_d &&
-                    (event.xkey.state & ControlMask) &&
+            /* Exit when the input is empty. */
+            else if (key_matches(KEY_EXIT_SHELL, key, event.xkey.state) &&
                     tab->length == 0) {
                 running = 0;
             }
