@@ -48,6 +48,8 @@ typedef struct {
     int active;
     int stopped;
     char command[INPUT_SIZE];
+
+    
 } ForegroundProcess;
 
 typedef struct {
@@ -84,6 +86,13 @@ typedef struct {
     int cursor;
     char cwd[4096];
     ForegroundProcess foreground;
+    /* Ctrl+R history search state. */
+    int history_search_active;
+    char history_search_term[INPUT_SIZE];
+
+    char saved_input[INPUT_SIZE];
+    int saved_length;
+    int saved_cursor;
 } Tab;
 
 Tab tabs[MAX_TABS];
@@ -124,6 +133,7 @@ typedef enum {
     KEY_EXIT_SHELL,
     KEY_COPY,
     KEY_PASTE,
+    KEY_HISTORY_SEARCH,
     KEY_ACTION_COUNT
 } KeyAction;
 
@@ -146,7 +156,8 @@ KeyBinding keybindings[KEY_ACTION_COUNT] = {
     [KEY_CLEAR_SCREEN]    = {XK_l, ControlMask},
     [KEY_EXIT_SHELL]      = {XK_d, ControlMask},
     [KEY_COPY]            = {XK_c, ControlMask | ShiftMask},
-    [KEY_PASTE]           = {XK_v, ControlMask | ShiftMask}
+    [KEY_PASTE]           = {XK_v, ControlMask | ShiftMask},
+    [KEY_HISTORY_SEARCH]  = {XK_r, ControlMask}
 };
 
 /* Names of actions used in ~/.terminatorrc. */
@@ -163,7 +174,8 @@ const char *key_action_names[KEY_ACTION_COUNT] = {
     "clear_screen",
     "exit_shell",
     "copy",
-    "paste"
+    "paste",
+    "history_search"
 };
 
 
@@ -679,9 +691,16 @@ void draw_input(Display *display, Window window, GC gc,
     XGetGCValues(display, gc, GCForeground, &gc_values);
     unsigned long normal_color = gc_values.foreground;
 
-    const char *prompt = tabs[active_tab].continuing
-                         ? ">"
-                         : "Terminator>";
+    const char *prompt;
+
+    if (tabs[active_tab].history_search_active) {
+        prompt = "Enter search term:";
+    }
+    else {
+        prompt = tabs[active_tab].continuing
+                ? ">"
+                : "Terminator>";
+    }
 
     XSetForeground(display, gc,
                    BlackPixel(display, DefaultScreen(display)));
@@ -689,7 +708,14 @@ void draw_input(Display *display, Window window, GC gc,
     XDrawString(display, window, gc,
                 10, PROMPT_Y, prompt, (int)strlen(prompt));
 
-    int input_x = tabs[active_tab].continuing ? 25 : 120;
+    int input_x;
+
+    if (tabs[active_tab].history_search_active) {
+        input_x = 160;
+    }
+    else {
+        input_x = tabs[active_tab].continuing ? 25 : 120;
+    }
 
     int start = selection_start;
     int end = selection_end;
@@ -1548,6 +1574,7 @@ int main(void)
 {
     /* Load user-configured keyboard shortcuts. */
     load_keybindings();
+    history_load();
     Display *display = XOpenDisplay(NULL);
 
     if (display == NULL) {
@@ -1978,6 +2005,121 @@ int main(void)
                 NULL
             );
             
+            /* Handle keyboard input while Ctrl+R search is active. */
+            if (tab->history_search_active) {
+            
+                /* Escape: cancel search and restore previous input. */
+                if (key == XK_Escape) {
+            
+                    strcpy(tab->input, tab->saved_input);
+                    tab->length = tab->saved_length;
+                    tab->cursor = tab->saved_cursor;
+            
+                    tab->history_search_active = 0;
+                }
+            
+                /* Backspace: remove the last character from search term. */
+                else if (key == XK_BackSpace) {
+            
+                    if (tab->length > 0) {
+                        tab->length--;
+                        tab->input[tab->length] = '\0';
+                        tab->cursor = tab->length;
+                    }
+            
+                    strcpy(tab->history_search_term, tab->input);
+                }
+            
+                /* Enter: perform the history search. */
+                else if (key == XK_Return || key == XK_KP_Enter) {
+            
+                    int matches[HISTORY_SIZE];
+            
+                    int match_count = history_search(
+                        tab->history_search_term,
+                        matches,
+                        HISTORY_SIZE
+                    );
+            
+                    if (match_count == 0) {
+            
+                        append_output(
+                            &tab->output,
+                            &tab->output_capacity,
+                            &tab->output_length,
+                            "No match for search term in history\n"
+                        );
+                    }
+                    else {
+            
+                        for (int i = 0; i < match_count; i++) {
+            
+                            char line[HISTORY_INPUT_SIZE + 2];
+            
+                            snprintf(
+                                line,
+                                sizeof(line),
+                                "%s\n",
+                                history[matches[i]]
+                            );
+            
+                            append_output(
+                                &tab->output,
+                                &tab->output_capacity,
+                                &tab->output_length,
+                                line
+                            );
+                        }
+                    }
+            
+                    /* Restore the command that was being typed before Ctrl+R. */
+                    strcpy(tab->input, tab->saved_input);
+                    tab->length = tab->saved_length;
+                    tab->cursor = tab->saved_cursor;
+            
+                    tab->history_search_active = 0;
+                }
+            
+                /* Add a character to the search term. */
+                else if (key_length > 0 &&
+                         tab->length + key_length < INPUT_SIZE) {
+            
+                    int valid_text = 1;
+            
+                    for (int i = 0; i < key_length; i++) {
+                        if (key_text[i] < 32 || key_text[i] > 126) {
+                            valid_text = 0;
+                            break;
+                        }
+                    }
+            
+                    if (valid_text) {
+            
+                        for (int i = 0; i < key_length; i++) {
+                            tab->input[tab->length++] = key_text[i];
+                        }
+            
+                        tab->input[tab->length] = '\0';
+                        tab->cursor = tab->length;
+            
+                        strcpy(tab->history_search_term, tab->input);
+                    }
+                }
+            
+                draw_input(
+                    display,
+                    window,
+                    gc,
+                    tab->input,
+                    tab->length,
+                    tab->output,
+                    tab->output_length
+                );
+            
+                XFlush(display);
+                continue;
+            }
+            
             /* Configurable paste shortcut. */
             if (key_matches(KEY_PASTE, key, event.xkey.state)) {
 
@@ -2028,6 +2170,38 @@ int main(void)
                     }
                 }
 
+                continue;
+            }
+            /* Ctrl+R: start history search. */
+            if (key_matches(KEY_HISTORY_SEARCH, key, event.xkey.state)) {
+
+                if (!tab->history_search_active) {
+
+                    /* Preserve the current command input. */
+                    strcpy(tab->saved_input, tab->input);
+                    tab->saved_length = tab->length;
+                    tab->saved_cursor = tab->cursor;
+
+                    /* Start with an empty search term. */
+                    tab->history_search_term[0] = '\0';
+                    tab->history_search_active = 1;
+
+                    tab->input[0] = '\0';
+                    tab->length = 0;
+                    tab->cursor = 0;
+                }
+
+                draw_input(
+                    display,
+                    window,
+                    gc,
+                    tab->input,
+                    tab->length,
+                    tab->output,
+                    tab->output_length
+                );
+
+                XFlush(display);
                 continue;
             }
             /* Handle Ctrl+Z: suspend the foreground command. */
@@ -2781,12 +2955,14 @@ int main(void)
                                 }
                             }
                             else if (strcmp(args[0], "history") == 0) {
-                                for (int i = 0; i < history_count; i++) {
+                                int start = history_count > 1000 ? history_count - 1000 : 0;
+                            
+                                for (int i = start; i < history_count; i++) {
                                     char history_line[120];
-
+                            
                                     snprintf(history_line, sizeof(history_line),
                                             "%d  %s\n", i + 1, history[i]);
-
+                            
                                     if (append_output(&tab->output,
                                                     &tab->output_capacity,
                                                     &tab->output_length,
@@ -2795,9 +2971,9 @@ int main(void)
                                         break;
                                     }
                                 }
-
+                            
                                 last_status = 0;
-                            }                            
+                            }                          
                             else if (strcmp(args[0], "jobs") == 0) {
                                 update_job_status();
 
