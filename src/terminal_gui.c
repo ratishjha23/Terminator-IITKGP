@@ -16,6 +16,7 @@
 #include <time.h>
 #include <poll.h>
 #include <strings.h>
+#include <dirent.h>
 
 #include "executor.h"
 #include "output_buffer.h"
@@ -93,6 +94,12 @@ typedef struct {
     char saved_input[INPUT_SIZE];
     int saved_length;
     int saved_cursor;
+
+    /* Tab-completion selection state. */
+    int completion_active;
+    int completion_word_start;
+    int completion_count;
+    char completion_matches[INPUT_SIZE][INPUT_SIZE];
 } Tab;
 
 Tab tabs[MAX_TABS];
@@ -822,6 +829,269 @@ int input_position_from_x(Display *display, GC gc,
     return position;
 }
 
+/* Find files whose names begin with the given word. */
+int find_file_matches(const char *cwd,
+                      const char *word,
+                      char matches[][INPUT_SIZE],
+                      int max_matches)
+{
+    char directory[4096];
+    char path_prefix[INPUT_SIZE];
+
+    const char *slash = strrchr(word, '/');
+    const char *filename_prefix;
+
+    int prefix_length = 0;
+
+    /* Determine the directory and filename prefix. */
+    if (slash != NULL) {
+
+        prefix_length = (int)(slash - word) + 1;
+
+        if (prefix_length >= INPUT_SIZE) {
+            return 0;
+        }
+
+        memcpy(path_prefix, word, (size_t)prefix_length);
+        path_prefix[prefix_length] = '\0';
+
+        filename_prefix = slash + 1;
+
+        /* Absolute path. */
+        if (word[0] == '/') {
+
+            int directory_length = (int)(slash - word);
+
+            if (directory_length == 0) {
+                strcpy(directory, "/");
+            } else {
+                memcpy(directory, word,
+                       (size_t)directory_length);
+                directory[directory_length] = '\0';
+            }
+        }
+
+        /* Relative path. */
+        else {
+
+            int directory_length = (int)(slash - word);
+
+            char relative_directory[INPUT_SIZE];
+
+            memcpy(relative_directory, word,
+                   (size_t)directory_length);
+            relative_directory[directory_length] = '\0';
+
+            snprintf(directory, sizeof(directory),
+                     "%s/%s", cwd, relative_directory);
+        }
+    }
+
+    /* No slash: search the tab's current directory. */
+    else {
+
+        strcpy(directory, cwd);
+
+        path_prefix[0] = '\0';
+        filename_prefix = word;
+    }
+
+    DIR *dir = opendir(directory);
+
+    if (dir == NULL) {
+        return 0;
+    }
+
+    int match_count = 0;
+    struct dirent *entry;
+
+    size_t search_length = strlen(filename_prefix);
+
+    while ((entry = readdir(dir)) != NULL) {
+
+        if (strncmp(entry->d_name,
+                    filename_prefix,
+                    search_length) == 0) {
+
+            if (match_count >= max_matches) {
+                break;
+            }
+
+            int result = snprintf(
+                matches[match_count],
+                INPUT_SIZE,
+                "%s%s",
+                path_prefix,
+                entry->d_name
+            );
+
+            if (result >= 0 && result < INPUT_SIZE) {
+                match_count++;
+            }
+        }
+    }
+
+    closedir(dir);
+
+    return match_count;
+}
+/* Find the longest common prefix among matching filenames. */
+int longest_common_prefix(char matches[][INPUT_SIZE],
+                          int match_count)
+{
+    if (match_count <= 0) {
+        return 0;
+    }
+
+    int length = (int)strlen(matches[0]);
+
+    for (int i = 1; i < match_count; i++) {
+
+        int j = 0;
+
+        while (j < length &&
+               matches[0][j] == matches[i][j]) {
+            j++;
+        }
+
+        length = j;
+
+        if (length == 0) {
+            break;
+        }
+    }
+
+    return length;
+}
+/* Complete the filename immediately before the cursor. */
+void complete_filename(Tab *tab)
+{
+    char prefix[INPUT_SIZE];
+    char matches[INPUT_SIZE][INPUT_SIZE];
+
+    /* Find the beginning of the word before the cursor. */
+    int word_start = tab->cursor;
+
+    while (word_start > 0 &&
+           tab->input[word_start - 1] != ' ' &&
+           tab->input[word_start - 1] != '\t') {
+        word_start--;
+    }
+
+    int prefix_length = tab->cursor - word_start;
+
+    if (prefix_length == 0) {
+        return;
+    }
+
+    memcpy(prefix, tab->input + word_start,
+           (size_t)prefix_length);
+    prefix[prefix_length] = '\0';
+
+    int match_count = find_file_matches(
+        tab->cwd,
+        prefix,
+        matches,
+        INPUT_SIZE
+    );
+
+    /* No matching filename. */
+    if (match_count == 0) {
+        return;
+    }
+
+    /* One match: complete the filename. */
+    if (match_count == 1) {
+        int completed_length = (int)strlen(matches[0]);
+        int suffix_length = tab->length - tab->cursor;
+
+        if (word_start + completed_length + suffix_length
+            >= INPUT_SIZE) {
+            return;
+        }
+
+        memmove(
+            tab->input + word_start + completed_length,
+            tab->input + tab->cursor,
+            (size_t)suffix_length + 1
+        );
+
+        memcpy(
+            tab->input + word_start,
+            matches[0],
+            (size_t)completed_length
+        );
+
+        tab->length = word_start + completed_length + suffix_length;
+        tab->cursor = word_start + completed_length;
+
+        return;
+    }
+
+    /* Multiple matches: complete their common prefix. */
+    int common_length = longest_common_prefix(
+        matches,
+        match_count
+    );
+
+    if (common_length > prefix_length) {
+
+        int suffix_length = tab->length - tab->cursor;
+
+        if (word_start + common_length + suffix_length
+            >= INPUT_SIZE) {
+            return;
+        }
+
+        memmove(
+            tab->input + word_start + common_length,
+            tab->input + tab->cursor,
+            (size_t)suffix_length + 1
+        );
+
+        memcpy(
+            tab->input + word_start,
+            matches[0],
+            (size_t)common_length
+        );
+
+        tab->length = word_start + common_length + suffix_length;
+        tab->cursor = word_start + common_length;
+    }
+    else {
+        /* Still ambiguous: remember the matching filenames. */
+        tab->completion_active = 1;
+        tab->completion_word_start = word_start;
+        tab->completion_count = match_count;
+
+        for (int i = 0; i < match_count; i++) {
+
+            strcpy(
+                tab->completion_matches[i],
+                matches[i]
+            );
+
+            char line[INPUT_SIZE + 32];
+
+            snprintf(
+                line,
+                sizeof(line),
+                "%d. %s\n",
+                i + 1,
+                matches[i]
+            );
+
+            append_output(
+                &tab->output,
+                &tab->output_capacity,
+                &tab->output_length,
+                line
+            );
+        }
+
+        tab->scroll_offset = 0;
+    }
+}
 /* Insert clipboard text at the current input cursor. */
 void insert_clipboard_text(Tab *tab,
                            const unsigned char *text,
@@ -2118,6 +2388,95 @@ int main(void)
             
                 XFlush(display);
                 continue;
+            }
+            /* Tab: complete the filename before the cursor. */
+            if (key == XK_Tab) {
+                /* Clear any previous completion choices. */
+                tab->completion_active = 0;
+                tab->completion_count = 0;
+
+                complete_filename(tab);
+
+
+                draw_input(
+                    display,
+                    window,
+                    gc,
+                    tab->input,
+                    tab->length,
+                    tab->output,
+                    tab->output_length
+                );
+
+                XFlush(display);
+                continue;
+            }
+            /* Select a filename using its displayed number. */
+            if (tab->completion_active) {
+
+                if (key >= XK_1 && key <= XK_9) {
+
+                    int choice = (int)(key - XK_1);
+
+                    if (choice < tab->completion_count) {
+
+                        char selected[INPUT_SIZE];
+
+                        strcpy(
+                            selected,
+                            tab->completion_matches[choice]
+                        );
+
+                        int word_start = tab->completion_word_start;
+                        int old_end = tab->cursor;
+
+                        int selected_length = (int)strlen(selected);
+                        int suffix_length = tab->length - old_end;
+
+                        if (word_start + selected_length + suffix_length
+                            < INPUT_SIZE) {
+
+                            /* Preserve everything after the cursor. */
+                            memmove(
+                                tab->input + word_start + selected_length,
+                                tab->input + old_end,
+                                (size_t)suffix_length + 1
+                            );
+
+                            /* Insert the selected filename. */
+                            memcpy(
+                                tab->input + word_start,
+                                selected,
+                                (size_t)selected_length
+                            );
+
+                            tab->length =
+                                word_start + selected_length + suffix_length;
+
+                            tab->cursor = word_start + selected_length;
+                        }
+
+                        tab->completion_active = 0;
+                        tab->completion_count = 0;
+
+                        draw_input(
+                            display,
+                            window,
+                            gc,
+                            tab->input,
+                            tab->length,
+                            tab->output,
+                            tab->output_length
+                        );
+
+                        XFlush(display);
+                        continue;
+                    }
+                }
+
+                /* Any other key cancels the pending selection. */
+                tab->completion_active = 0;
+                tab->completion_count = 0;
             }
             
             /* Configurable paste shortcut. */
