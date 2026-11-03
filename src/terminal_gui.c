@@ -1084,7 +1084,10 @@ void draw_input(Display *display, Window window, GC gc,
     } else {
         input_x = tabs[active_tab].continuing ? 25 : 140;
     }
+<<<<<<< HEAD
 >>>>>>> 5e4b7c0 (final for now)
+=======
+>>>>>>> 421ba81 (Update terminal GUI)
 
     int start = selection_start;
     int end = selection_end;
@@ -2195,6 +2198,7 @@ static void multiwatch_update(Tab *tab)
 }
 int main(int argc, char *argv[])
 <<<<<<< HEAD
+<<<<<<< HEAD
 {   
     if (argc == 2 && strcmp(argv[1], "useProcess=True") == 0) {
         use_process_mode = 1;
@@ -2207,6 +2211,8 @@ int main(int argc, char *argv[])
     printf("Terminator mode: %s\n",
         use_process_mode ? "Process" : "Thread");
 =======
+=======
+>>>>>>> 421ba81 (Update terminal GUI)
 {
     int use_process = 0;
 
@@ -2218,7 +2224,10 @@ int main(int argc, char *argv[])
 
     printf("%s\\n", use_process ? "Process mode" : "Thread mode");
     fflush(stdout);
+<<<<<<< HEAD
 >>>>>>> 5e4b7c0 (final for now)
+=======
+>>>>>>> 421ba81 (Update terminal GUI)
     /* Load user-configured keyboard shortcuts. */
     load_keybindings();
     history_load();
@@ -3287,7 +3296,10 @@ int main(int argc, char *argv[])
                                   &tab->output_capacity,
                                   &tab->output_length,
                                   "user@terminator>\n");
+<<<<<<< HEAD
 >>>>>>> 5e4b7c0 (final for now)
+=======
+>>>>>>> 421ba81 (Update terminal GUI)
 
                     tab->scroll_offset = 0;
                 }
@@ -3471,10 +3483,14 @@ int main(int argc, char *argv[])
 
                     snprintf(command_line, sizeof(command_line),
 <<<<<<< HEAD
+<<<<<<< HEAD
                             "%s %s\n", prompt, tab->input);
 =======
                              "user@terminator> %s\n", tab->input);
 >>>>>>> 5e4b7c0 (final for now)
+=======
+                             "user@terminator> %s\n", tab->input);
+>>>>>>> 421ba81 (Update terminal GUI)
 
                     if (append_output(&tab->output,
                                       &tab->output_capacity,
