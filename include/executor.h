@@ -5,15 +5,17 @@
 #define MAX_PIPE_ARGS 10
 
 int run_command(char *args[],
-                char **output,
-                int *output_capacity,
-                int *output_length);
+    const char *cwd,
+    char **output,
+    int *output_capacity,
+    int *output_length);
 
 int run_pipeline(
     char *commands[][MAX_PIPE_ARGS],
     int command_count,
     const char *input_file,
     const char *output_file,
+    const char *cwd,
     char **output,
     int *output_capacity,
     int *output_length

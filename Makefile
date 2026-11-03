@@ -1,7 +1,7 @@
 
 CC = gcc
 CFLAGS = -Wall -Wextra -std=c11 -D_POSIX_C_SOURCE=200809L -Iinclude
-GUI_LIBS = -lX11
+GUI_LIBS = -lX11 -pthread
 
 # GUI terminal
 

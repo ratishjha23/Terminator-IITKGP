@@ -1,4 +1,4 @@
-
+#define _XOPEN_SOURCE 700
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/keysym.h>
@@ -16,13 +16,18 @@
 #include <time.h>
 #include <poll.h>
 #include <strings.h>
+#include <pthread.h>
 #include <dirent.h>
+#include <limits.h>
+#include <sys/stat.h>
+
 
 #include "executor.h"
 #include "output_buffer.h"
 #include "parser.h"
 #include "history.h"
 #include "multiwatch.h"
+
 
 #define WINDOW_WIDTH 500
 #define WINDOW_HEIGHT 300
@@ -53,6 +58,28 @@ typedef struct {
     
 } ForegroundProcess;
 
+typedef struct {
+    pthread_t thread_id;
+    int thread_started;
+
+    pthread_mutex_t command_mutex;
+    pthread_cond_t command_cond;
+
+    char pending_command[INPUT_SIZE];
+    int command_pending;
+    int worker_running;
+
+    /* Command execution context. */
+    char cwd[4096];
+
+    /* Output produced by the worker. */
+    char *output;
+    int output_capacity;
+    int output_length;
+
+    int result_ready;
+    int exit_status;
+} TabWorker;
 typedef struct {
     int running;
     int round_active;
@@ -100,17 +127,21 @@ typedef struct {
     int completion_word_start;
     int completion_count;
     char completion_matches[INPUT_SIZE][INPUT_SIZE];
+
+    TabWorker *worker;
 } Tab;
 
 Tab tabs[MAX_TABS];
 int tab_count = 0;
 int active_tab = 0;
 int last_status = 0;
+int use_process_mode = 0;
 /* Mouse selection in the command input line. */
 int selection_start = -1;
 int selection_end = -1;
 int selecting_text = 0;
 
+pthread_mutex_t history_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* X11 clipboard state. */
 Atom clipboard_atom;
@@ -184,7 +215,7 @@ const char *key_action_names[KEY_ACTION_COUNT] = {
     "paste",
     "history_search"
 };
-
+void *tab_worker(void *arg);
 
 /* Remove spaces from the beginning and end of a string. */
 char *trim_whitespace(char *str)
@@ -590,6 +621,27 @@ void draw_output(Display *display, Window window, GC gc,
 int initialize_tab(int index)
 {
     Tab *tab = &tabs[index];
+    tab->worker = calloc(1, sizeof(TabWorker));
+
+    if (tab->worker == NULL) {
+        perror("Failed to allocate tab worker");
+        return -1;
+    }
+
+    if (pthread_mutex_init(&tab->worker->command_mutex, NULL) != 0) {
+        fprintf(stderr, "Failed to initialize command mutex.\n");
+        free(tab->worker);
+        tab->worker = NULL;
+        return -1;
+    }
+
+    if (pthread_cond_init(&tab->worker->command_cond, NULL) != 0) {
+        fprintf(stderr, "Failed to initialize command condition variable.\n");
+        pthread_mutex_destroy(&tab->worker->command_mutex);
+        free(tab->worker);
+        tab->worker = NULL;
+        return -1;
+    }
     tab->input[0] = '\0';
     tab->length = 0;
     tab->cursor = 0;
@@ -610,6 +662,12 @@ int initialize_tab(int index)
     tab->output = malloc((size_t)tab->output_capacity);
 
     if (tab->output == NULL) {
+        pthread_mutex_destroy(&tab->worker->command_mutex);
+        pthread_cond_destroy(&tab->worker->command_cond);
+    
+        free(tab->worker);
+        tab->worker = NULL;
+    
         return -1;
     }
 
@@ -621,14 +679,245 @@ int initialize_tab(int index)
     if (getcwd(tab->cwd, sizeof(tab->cwd)) == NULL) {
         tab->cwd[0] = '\0';
     }
+    /* Give the worker its own working directory. */
+    snprintf(
+        tab->worker->cwd,
+        sizeof(tab->worker->cwd),
+        "%s",
+        tab->cwd[0] != '\0' ? tab->cwd : "."
+    );
+
+    /* Allocate a separate output buffer for the worker. */
+    tab->worker->output_capacity = 4096;
+    tab->worker->output_length = 0;
+    tab->worker->output = malloc(
+        (size_t)tab->worker->output_capacity
+    );
+
+    if (tab->worker->output == NULL) {
+        perror("Failed to allocate worker output buffer");
+
+        pthread_mutex_destroy(&tab->worker->command_mutex);
+        pthread_cond_destroy(&tab->worker->command_cond);
+
+        free(tab->worker);
+        tab->worker = NULL;
+
+        free(tab->output);
+        tab->output = NULL;
+
+        return -1;
+    }
+
+    tab->worker->output[0] = '\0';
+    if (!use_process_mode) {
+        tab->worker->worker_running = 1;
+
+        int thread_error = pthread_create(
+            &tab->worker->thread_id,
+            NULL,
+            tab_worker,
+            tab->worker
+        );
+
+        if (thread_error != 0) {
+            fprintf(stderr, "Failed to create tab worker thread: %s\n",
+                    strerror(thread_error));
+
+            tab->worker->worker_running = 0;
+
+            pthread_mutex_destroy(&tab->worker->command_mutex);
+            pthread_cond_destroy(&tab->worker->command_cond);
+
+            free(tab->worker);
+            tab->worker = NULL;
+
+            free(tab->output);
+            tab->output = NULL;
+
+            return -1;
+        }
+
+        tab->worker->thread_started = 1;
+    }
 
     return 0;
 }
 
+void *tab_worker(void *arg)
+{
+    TabWorker *worker = (TabWorker *)arg;
+
+    while (1) {
+        pthread_mutex_lock(&worker->command_mutex);
+
+        while (worker->worker_running &&
+               !worker->command_pending) {
+            pthread_cond_wait(
+                &worker->command_cond,
+                &worker->command_mutex
+            );
+        }
+
+        if (!worker->worker_running) {
+            pthread_mutex_unlock(&worker->command_mutex);
+            break;
+        }
+
+        char command[INPUT_SIZE];
+
+        strcpy(command, worker->pending_command);
+        worker->command_pending = 0;
+
+        pthread_mutex_unlock(&worker->command_mutex);
+
+        /* Prepare a fresh output buffer for this command. */
+        worker->output_length = 0;
+        worker->output[0] = '\0';
+
+        /* Parse the command into arguments. */
+        char *args[MAX_PIPE_ARGS];
+
+        int arg_count = parse_command(command, args);
+
+        int status = 0;
+
+        if (arg_count < 0) {
+            append_output(
+                &worker->output,
+                &worker->output_capacity,
+                &worker->output_length,
+                "Error: invalid command or too many arguments.\n"
+            );
+
+            status = 1;
+        }
+        else if (arg_count > 0) {
+            status = run_command(
+                args,
+                worker->cwd,
+                &worker->output,
+                &worker->output_capacity,
+                &worker->output_length
+            );
+
+            if (status == -1) {
+                append_output(
+                    &worker->output,
+                    &worker->output_capacity,
+                    &worker->output_length,
+                    "Error executing command.\n"
+                );
+
+                status = 1;
+            }
+        }
+
+        /* Publish the result for the GUI thread. */
+        pthread_mutex_lock(&worker->command_mutex);
+
+        worker->exit_status = status;
+        worker->result_ready = 1;
+
+        pthread_mutex_unlock(&worker->command_mutex);
+    }
+
+    return NULL;
+}
+int submit_worker_command(Tab *tab, const char *command)
+{
+    if (tab == NULL || tab->worker == NULL ||
+        !tab->worker->thread_started) {
+        return -1;
+    }
+
+    TabWorker *worker = tab->worker;
+
+    pthread_mutex_lock(&worker->command_mutex);
+
+    if (!worker->worker_running ||
+        worker->command_pending ||
+        worker->result_ready) {
+
+        pthread_mutex_unlock(&worker->command_mutex);
+        return -1;
+    }
+
+    snprintf(
+        worker->pending_command,
+        sizeof(worker->pending_command),
+        "%s",
+        command
+    );
+
+    worker->command_pending = 1;
+
+    pthread_cond_signal(&worker->command_cond);
+
+    pthread_mutex_unlock(&worker->command_mutex);
+
+    return 0;
+}
+int collect_worker_result(Tab *tab)
+{
+    if (tab == NULL || tab->worker == NULL) {
+        return 0;
+    }
+
+    TabWorker *worker = tab->worker;
+
+    pthread_mutex_lock(&worker->command_mutex);
+
+    if (!worker->result_ready) {
+        pthread_mutex_unlock(&worker->command_mutex);
+        return 0;
+    }
+
+    int status = worker->exit_status;
+
+    if (worker->output_length > 0) {
+        append_output(
+            &tab->output,
+            &tab->output_capacity,
+            &tab->output_length,
+            worker->output
+        );
+    }
+
+    worker->result_ready = 0;
+
+    pthread_mutex_unlock(&worker->command_mutex);
+
+    last_status = status;
+    tab->scroll_offset = 0;
+
+    return 1;
+}
 void close_tab(int index)
 {
     if (index < 0 || index >= tab_count) {
         return;
+    }
+
+    TabWorker *worker = tabs[index].worker;
+
+    if (worker != NULL) {
+        if (worker->thread_started) {
+            pthread_mutex_lock(&worker->command_mutex);
+
+            worker->worker_running = 0;
+            pthread_cond_signal(&worker->command_cond);
+
+            pthread_mutex_unlock(&worker->command_mutex);
+
+            pthread_join(worker->thread_id, NULL);
+        }
+
+        pthread_mutex_destroy(&worker->command_mutex);
+        pthread_cond_destroy(&worker->command_cond);
+
+        free(worker);
+        tabs[index].worker = NULL;
     }
 
     free(tabs[index].output);
@@ -708,7 +997,6 @@ void draw_input(Display *display, Window window, GC gc,
                 ? ">"
                 : "Terminator>";
     }
-
     XSetForeground(display, gc,
                    BlackPixel(display, DefaultScreen(display)));
 
@@ -1131,7 +1419,8 @@ int run_background(
     char *args[],
     const char *command,
     const char *input_file,
-    const char *output_file
+    const char *output_file,
+    const char *cwd
 )
 {
     
@@ -1148,6 +1437,10 @@ int run_background(
     }
 
     if (pid == 0) {
+        if (cwd != NULL && chdir(cwd) == -1) {
+            perror("chdir");
+            _exit(1);
+        }
         /* Create a separate process group for this job. */
         if (setpgid(0, 0) == -1) {
             perror("setpgid");
@@ -1254,7 +1547,11 @@ int run_foreground_async(
             perror("setpgid");
             _exit(1);
         }
-
+        /* Execute the command in this tab's directory. */
+        if (tab->cwd[0] != '\0' && chdir(tab->cwd) == -1) {
+            perror("chdir");
+            _exit(1);
+        }
         /* Redirect standard error to the output pipe. */
         if (dup2(pipefd[1], STDERR_FILENO) == -1) {
             perror("dup2 stderr");
@@ -1840,8 +2137,18 @@ static void multiwatch_update(Tab *tab)
         multiwatch_session.next_refresh_time = time(NULL) + 2;
     }
 }
-int main(void)
-{
+int main(int argc, char *argv[])
+{   
+    if (argc == 2 && strcmp(argv[1], "useProcess=True") == 0) {
+        use_process_mode = 1;
+    }
+    else if (argc != 1) {
+        fprintf(stderr, "Usage: %s [useProcess=True]\n", argv[0]);
+        return 1;
+    }
+
+    printf("Terminator mode: %s\n",
+        use_process_mode ? "Process" : "Thread");
     /* Load user-configured keyboard shortcuts. */
     load_keybindings();
     history_load();
@@ -1947,16 +2254,22 @@ int main(void)
             }
 
             int has_foreground_process = 0;
+            int has_worker = 0;
 
             for (int i = 0; i < tab_count; i++) {
                 if (tabs[i].foreground.active) {
                     has_foreground_process = 1;
-                    break;
+                }
+
+                if (tabs[i].worker != NULL &&
+                    tabs[i].worker->thread_started) {
+                    has_worker = 1;
                 }
             }
 
             int timeout = (multiwatch_session.running ||
-                        has_foreground_process) ? 100 : -1;
+                        has_foreground_process ||
+                        has_worker) ? 100 : -1;
 
             int ready = poll(poll_fds, fd_count, timeout);
 
@@ -1990,6 +2303,10 @@ int main(void)
 
                     update_foreground_output(&tabs[i]);
                 }
+            }
+            /* Collect completed commands from tab workers. */
+            for (int i = 0; i < tab_count; i++) {
+                collect_worker_result(&tabs[i]);
             }
 
             /* Update multiWatch even when no keyboard event arrives. */
@@ -2164,10 +2481,6 @@ int main(void)
                     }
                     else {
                         active_tab = clicked_tab;
-
-                        if (chdir(tabs[active_tab].cwd) == -1) {
-                            /* Keep the current directory if restoration fails. */
-                        }
                     }
                 }
 
@@ -3137,6 +3450,7 @@ int main(void)
                                 command_count,
                                 input_file[0] != '\0' ? input_file : NULL,
                                 output_file[0] != '\0' ? output_file : NULL,
+                                tab->cwd,
                                 &tab->output,
                                 &tab->output_capacity,
                                 &tab->output_length
@@ -3182,15 +3496,15 @@ int main(void)
                         
                         else if (arg_count > 0) {
                             if (strcmp(args[0], "cd") == 0) {
-                                const char *directory;
-
-                                if (args[1] == NULL) {
+                                char *directory;
+                            
+                                if (args[1] == NULL || strcmp(args[1], "~") == 0) {
                                     directory = getenv("HOME");
                                 }
                                 else {
                                     directory = args[1];
                                 }
-
+                            
                                 if (directory == NULL) {
                                     append_output(
                                         &tab->output,
@@ -3198,30 +3512,91 @@ int main(void)
                                         &tab->output_length,
                                         "Error: HOME is not set.\n"
                                     );
+                                    last_status = 1;
                                 }
-
-                                else if (chdir(directory) == -1) {
-                                    char error_message[INPUT_SIZE + 100];
-
-                                    snprintf(
-                                        error_message,
-                                        sizeof(error_message),
-                                        "cd: %s: %s\n",
-                                        directory, strerror(errno)
-                                    );
-
-                                    append_output(
-                                        &tab->output,
-                                        &tab->output_capacity,
-                                        &tab->output_length,
-                                        error_message
-                                    );
-                                }
-
                                 else {
-                                    if (getcwd(tab->cwd,
-                                               sizeof(tab->cwd)) == NULL) {
-                                        tab->cwd[0] = '\0';
+                                    char target[PATH_MAX];
+                            
+                                    if (directory[0] == '/') {
+                                        snprintf(target, sizeof(target), "%s", directory);
+                                    }
+                                    else {
+                                        int written = snprintf(
+                                            target,
+                                            sizeof(target),
+                                            "%s/%s",
+                                            tab->cwd,
+                                            directory
+                                        );
+                                        
+                                        if (written < 0 || (size_t)written >= sizeof(target)) {
+                                            fprintf(stderr, "cd: path is too long\n");
+                                            last_status = 1;
+                                            continue;
+                                        }
+                                    }
+                            
+                                    char resolved[PATH_MAX];
+                            
+                                    if (realpath(target, resolved) == NULL) {
+                                        char error_message[INPUT_SIZE + 100];
+                            
+                                        snprintf(
+                                            error_message,
+                                            sizeof(error_message),
+                                            "cd: %s: %s\n",
+                                            directory,
+                                            strerror(errno)
+                                        );
+                            
+                                        append_output(
+                                            &tab->output,
+                                            &tab->output_capacity,
+                                            &tab->output_length,
+                                            error_message
+                                        );
+                            
+                                        last_status = 1;
+                                    }
+                                    else if (access(resolved, X_OK) == -1) {
+                                        last_status = 1;
+                                    }
+                                    else {
+                                        struct stat st;
+                            
+                                        if (stat(resolved, &st) == -1 || !S_ISDIR(st.st_mode)) {
+                                            append_output(
+                                                &tab->output,
+                                                &tab->output_capacity,
+                                                &tab->output_length,
+                                                "cd: not a directory\n"
+                                            );
+                                            last_status = 1;
+                                        }
+                                        else {
+                                            snprintf(
+                                                tab->cwd,
+                                                sizeof(tab->cwd),
+                                                "%s",
+                                                resolved
+                                            );
+                                            
+                                            /* Update the worker's working directory too. */
+                                            if (tab->worker != NULL) {
+                                                pthread_mutex_lock(&tab->worker->command_mutex);
+                                            
+                                                snprintf(
+                                                    tab->worker->cwd,
+                                                    sizeof(tab->worker->cwd),
+                                                    "%s",
+                                                    resolved
+                                                );
+                                            
+                                                pthread_mutex_unlock(&tab->worker->command_mutex);
+                                            }
+                                            
+                                            last_status = 0;
+                                        }
                                     }
                                 }
                             }
@@ -3234,7 +3609,24 @@ int main(void)
                                                 "source: missing filename\n");
                                     last_status = 1;
                                 } else {
-                                    FILE *script = fopen(args[1], "r");
+                                    char script_path[PATH_MAX];
+
+                                    int path_length;
+
+                                    if (args[1][0] == '/') {
+                                        path_length = snprintf(script_path, sizeof(script_path),
+                                                            "%s", args[1]);
+                                    }
+                                    else {
+                                        path_length = snprintf(script_path, sizeof(script_path),
+                                                            "%s/%s", tab->cwd, args[1]);
+                                    }
+
+                                    FILE *script = NULL;
+
+                                    if (path_length >= 0 && (size_t)path_length < sizeof(script_path)) {
+                                        script = fopen(script_path, "r");
+                                    }
 
                                     if (script == NULL) {
                                         char error_message[INPUT_SIZE + 100];
@@ -3277,24 +3669,53 @@ int main(void)
                                                     script_args[1] != NULL
                                                     ? script_args[1] : getenv("HOME");
 
-                                                if (directory == NULL || chdir(directory) == -1) {
-                                                    append_output(&tab->output,
-                                                                &tab->output_capacity,
-                                                                &tab->output_length,
-                                                                "source: cd failed\n");
-                                                    last_status = 1;
-                                                } else {
-                                                    if (getcwd(tab->cwd, sizeof(tab->cwd)) == NULL) {
-                                                        tab->cwd[0] = '\0';
+                                                    char target[PATH_MAX];
+                                                    char resolved[PATH_MAX];
+                                                    
+                                                    if (directory == NULL) {
+                                                        last_status = 1;
                                                     }
-                                                    last_status = 0;
-                                                }
+                                                    else {
+                                                        int written;
+                                                    
+                                                        if (directory[0] == '/') {
+                                                            written = snprintf(target, sizeof(target), "%s", directory);
+                                                        }
+                                                        else {
+                                                            written = snprintf(target, sizeof(target), "%s/%s",
+                                                                               tab->cwd, directory);
+                                                        }
+                                                    
+                                                        if (written < 0 || (size_t)written >= sizeof(target) ||
+                                                            realpath(target, resolved) == NULL) {
+                                                            last_status = 1;
+                                                        }
+                                                        else {
+                                                            struct stat st;
+                                                    
+                                                            if (stat(resolved, &st) == -1 || !S_ISDIR(st.st_mode)) {
+                                                                last_status = 1;
+                                                            }
+                                                            else {
+                                                                snprintf(tab->cwd, sizeof(tab->cwd), "%s", resolved);
+                                                                last_status = 0;
+                                                            }
+                                                        }
+                                                    }
+                                                    
+                                                    if (last_status != 0) {
+                                                        append_output(&tab->output,
+                                                                      &tab->output_capacity,
+                                                                      &tab->output_length,
+                                                                      "source: cd failed\n");
+                                                    }
                                             } else if (strcmp(script_args[0], "exit") == 0) {
                                                 running = 0;
                                                 break;
                                             } else {
                                                 last_status = run_command(
                                                     script_args,
+                                                    tab->cwd,
                                                     &tab->output,
                                                     &tab->output_capacity,
                                                     &tab->output_length
@@ -3478,7 +3899,8 @@ int main(void)
                                         args,
                                         tab->input,
                                         input_file[0] != '\0' ? input_file : NULL,
-                                        output_file[0] != '\0' ? output_file : NULL
+                                        output_file[0] != '\0' ? output_file : NULL,
+                                        tab->cwd
                                     );
 
                                     if (pid == -1) {
@@ -3507,26 +3929,48 @@ int main(void)
                                     }
                                 }
                                 else {
-                                    int result = run_foreground_async(
-                                        tab,
-                                        args,
-                                        tab->input,
-                                        input_file[0] != '\0' ? input_file : NULL,
-                                        output_file[0] != '\0' ? output_file : NULL
-                                    );
+                                    if (!use_process_mode &&
+                                        tab->worker != NULL &&
+                                        tab->worker->thread_started &&
+                                        input_file[0] == '\0' &&
+                                        output_file[0] == '\0') {
                                 
-                                    if (result == -1) {
-                                        append_output(
-                                            &tab->output,
-                                            &tab->output_capacity,
-                                            &tab->output_length,
-                                            "Error starting foreground command.\n"
-                                        );
+                                        if (submit_worker_command(tab, tab->input) == -1) { 
+                                            append_output(
+                                                &tab->output,
+                                                &tab->output_capacity,
+                                                &tab->output_length,
+                                                "Error: worker is busy or unavailable.\n"
+                                            );
                                 
-                                        last_status = 1;
+                                            last_status = 1;
+                                        }
+                                        else {
+                                            last_status = 0;
+                                        }
                                     }
                                     else {
-                                        last_status = 0;
+                                        int result = run_foreground_async(
+                                            tab,
+                                            args,
+                                            tab->input,
+                                            input_file[0] != '\0' ? input_file : NULL,
+                                            output_file[0] != '\0' ? output_file : NULL
+                                        );
+                                
+                                        if (result == -1) {
+                                            append_output(
+                                                &tab->output,
+                                                &tab->output_capacity,
+                                                &tab->output_length,
+                                                "Error starting foreground command.\n"
+                                            );
+                                
+                                            last_status = 1;
+                                        }
+                                        else {
+                                            last_status = 0;
+                                        }
                                     }
                                 }
                             }
@@ -3766,16 +4210,39 @@ int main(void)
                 tab->length,
                 tab->output,
                 tab->output_length
-            );
-
-XFlush(display);
-        
+            );        
             XFlush(display);
         }
     }
 
-    /* Free every tab's output buffer. */
+    /* Clean up every tab and its worker. */
     for (int i = 0; i < tab_count; i++) {
+
+        TabWorker *worker = tabs[i].worker;
+
+        if (worker != NULL) {
+
+            if (worker->thread_started) {
+
+                pthread_mutex_lock(&worker->command_mutex);
+
+                worker->worker_running = 0;
+                pthread_cond_signal(&worker->command_cond);
+
+                pthread_mutex_unlock(&worker->command_mutex);
+
+                pthread_join(worker->thread_id, NULL);
+            }
+
+            pthread_mutex_destroy(&worker->command_mutex);
+            pthread_cond_destroy(&worker->command_cond);
+
+            free(worker->output);
+            free(worker);
+
+            tabs[i].worker = NULL;
+        }
+
         free(tabs[i].output);
     }
 

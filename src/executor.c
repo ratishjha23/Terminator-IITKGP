@@ -12,8 +12,10 @@
 #include <fcntl.h>
 /* Execute one command and capture its stdout and stderr. */
 int run_command(char *args[],
-                char **output, int *output_capacity,
-                int *output_length)
+    const char *cwd,
+    char **output,
+    int *output_capacity,
+    int *output_length)
 {
     int output_pipe[2];
 
@@ -32,6 +34,13 @@ int run_command(char *args[],
     }
 
     if (pid == 0) {
+
+        /* Execute the command in this tab's directory. */
+        if (cwd != NULL && chdir(cwd) == -1) {
+            perror("chdir");
+            _exit(1);
+        }
+
         close(output_pipe[0]);
 
         if (dup2(output_pipe[1], STDOUT_FILENO) == -1 ||
@@ -112,6 +121,7 @@ int run_command(char *args[],
     int command_count,
     const char *input_file,
     const char *output_file,
+    const char *cwd,
     char **output,
     int *output_capacity,
     int *output_length
@@ -181,6 +191,13 @@ int run_command(char *args[],
         }
 
         if (pids[i] == 0) {
+
+            /* Execute this pipeline command in the tab's directory. */
+            if (cwd != NULL && chdir(cwd) == -1) {
+                perror("chdir");
+                _exit(1);
+            }
+
             /* Read input from the previous command. */
             if (i > 0) {
                 if (dup2(pipes[i - 1][0], STDIN_FILENO) == -1) {
