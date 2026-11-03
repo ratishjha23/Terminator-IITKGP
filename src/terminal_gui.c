@@ -1049,84 +1049,90 @@ void draw_input(Display *display, Window window, GC gc,
     XGetGCValues(display, gc, GCForeground, &gc_values);
     unsigned long normal_color = gc_values.foreground;
 
+<<<<<<< HEAD
     char prompt[4096];
     build_prompt(&tabs[active_tab], prompt, sizeof(prompt));
+=======
+    const char *prompt;
+
+    if (tabs[active_tab].history_search_active) {
+        prompt = "Enter search term:";
+    }
+    else {
+        prompt = tabs[active_tab].continuing
+                ? ">"
+                : "user@terminator>";
+    }
+>>>>>>> 5e4b7c0 (final for now)
 
     XSetForeground(display, gc,
                 BlackPixel(display, DefaultScreen(display)));
 
+    /* Keep the prompt and input inside the bottom two rows. */
+    const int first_input_y = PROMPT_Y - LINE_HEIGHT;
     XDrawString(display, window, gc,
-                10, PROMPT_Y, prompt, (int)strlen(prompt));
+                10, first_input_y, prompt, (int)strlen(prompt));
 
+<<<<<<< HEAD
     int input_x = calculate_input_x(
         display, gc, &tabs[active_tab]
     );
+=======
+    int input_x;
+    if (tabs[active_tab].history_search_active) {
+        input_x = 160;
+    } else {
+        input_x = tabs[active_tab].continuing ? 25 : 140;
+    }
+>>>>>>> 5e4b7c0 (final for now)
 
     int start = selection_start;
     int end = selection_end;
-
     if (start > end) {
         int temp = start;
         start = end;
         end = temp;
     }
-
-    /* Clamp selection positions to the current input. */
     if (start < 0 || end <= start || end > length) {
         start = -1;
         end = -1;
     }
 
-    if (start >= 0) {
-        XFontStruct *font =
-            XQueryFont(display, XGContextFromGC(gc));
+    XFontStruct *font = XQueryFont(display, XGContextFromGC(gc));
+    if (font != NULL) {
+        int x = input_x;
+        int y = first_input_y;
+        const int right_edge = WINDOW_WIDTH - 10;
 
-        if (font != NULL) {
-            int prefix_width = XTextWidth(font, input, start);
-            int selected_width =
-                XTextWidth(font, input + start, end - start);
+        /* Draw one character at a time so long input wraps at the GUI edge. */
+        for (int i = 0; i < length; i++) {
+            int char_width = XTextWidth(font, input + i, 1);
+            if (x + char_width > right_edge && x > 10) {
+                x = 10;
+                y += LINE_HEIGHT;
+            }
 
-            /* Draw the selected region's black background. */
-            XSetForeground(display, gc,
-                           BlackPixel(display, DefaultScreen(display)));
+            if (i >= start && i < end) {
+                XSetForeground(display, gc,
+                               BlackPixel(display, DefaultScreen(display)));
+                XFillRectangle(display, window, gc,
+                               x, y - font->ascent,
+                               (unsigned int)char_width,
+                               (unsigned int)(font->ascent + font->descent));
+                XSetForeground(display, gc,
+                               WhitePixel(display, DefaultScreen(display)));
+            } else {
+                XSetForeground(display, gc,
+                               BlackPixel(display, DefaultScreen(display)));
+            }
 
-            XFillRectangle(display, window, gc,
-                           input_x + prefix_width,
-                           PROMPT_Y - font->ascent,
-                           (unsigned int)selected_width,
-                           (unsigned int)(font->ascent + font->descent));
-
-            /* Normal text before the selection. */
-            XDrawString(display, window, gc,
-                        input_x, PROMPT_Y, input, start);
-
-            /* Selected text in white. */
-            XSetForeground(display, gc,
-                           WhitePixel(display, DefaultScreen(display)));
-
-            XDrawString(display, window, gc,
-                        input_x + prefix_width, PROMPT_Y,
-                        input + start, end - start);
-
-            /* Normal text after the selection. */
-            XSetForeground(display, gc,
-                           BlackPixel(display, DefaultScreen(display)));
-
-            int suffix_x = input_x +
-                XTextWidth(font, input, end);
-
-            XDrawString(display, window, gc,
-                        suffix_x, PROMPT_Y,
-                        input + end, length - end);
-
-            XFreeFontInfo(NULL, font, 1);
-        } else {
-            XDrawString(display, window, gc,
-                        input_x, PROMPT_Y, input, length);
+            XDrawString(display, window, gc, x, y, input + i, 1);
+            x += char_width;
         }
+        XFreeFontInfo(NULL, font, 1);
     } else {
-        XDrawString(display, window, gc,
-                    input_x, PROMPT_Y, input, length);
+        XDrawString(display, window, gc, input_x, first_input_y,
+                    input, length);
     }
 
     /* Restore the GC foreground for subsequent drawing. */
@@ -2188,6 +2194,7 @@ static void multiwatch_update(Tab *tab)
     }
 }
 int main(int argc, char *argv[])
+<<<<<<< HEAD
 {   
     if (argc == 2 && strcmp(argv[1], "useProcess=True") == 0) {
         use_process_mode = 1;
@@ -2199,6 +2206,19 @@ int main(int argc, char *argv[])
 
     printf("Terminator mode: %s\n",
         use_process_mode ? "Process" : "Thread");
+=======
+{
+    int use_process = 0;
+
+    for (int i = 1; i < argc; i++) {
+        if (strcasecmp(argv[i], "useprocess=true") == 0) {
+            use_process = 1;
+        }
+    }
+
+    printf("%s\\n", use_process ? "Process mode" : "Thread mode");
+    fflush(stdout);
+>>>>>>> 5e4b7c0 (final for now)
     /* Load user-configured keyboard shortcuts. */
     load_keybindings();
     history_load();
@@ -3259,9 +3279,15 @@ int main(int argc, char *argv[])
                     snprintf(prompt_line, sizeof(prompt_line), "%s\n", prompt);
 
                     append_output(&tab->output,
+<<<<<<< HEAD
                                 &tab->output_capacity,
                                 &tab->output_length,
                                 prompt_line);
+=======
+                                  &tab->output_capacity,
+                                  &tab->output_length,
+                                  "user@terminator>\n");
+>>>>>>> 5e4b7c0 (final for now)
 
                     tab->scroll_offset = 0;
                 }
@@ -3332,8 +3358,14 @@ int main(int argc, char *argv[])
                             char multiwatch_command_line[INPUT_SIZE + 4200];
 
                             snprintf(multiwatch_command_line,
+<<<<<<< HEAD
                                     sizeof(multiwatch_command_line),
                                     "%s %s\n", prompt, tab->input);
+=======
+                                     sizeof(multiwatch_command_line),
+                                     "user@terminator> %s\n", tab->input);
+                            
+>>>>>>> 5e4b7c0 (final for now)
                             append_output(&tab->output,
                                           &tab->output_capacity,
                                           &tab->output_length,
@@ -3438,7 +3470,11 @@ int main(int argc, char *argv[])
                     char command_line[INPUT_SIZE + 4200];
 
                     snprintf(command_line, sizeof(command_line),
+<<<<<<< HEAD
                             "%s %s\n", prompt, tab->input);
+=======
+                             "user@terminator> %s\n", tab->input);
+>>>>>>> 5e4b7c0 (final for now)
 
                     if (append_output(&tab->output,
                                       &tab->output_capacity,
