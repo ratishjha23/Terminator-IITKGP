@@ -149,6 +149,68 @@ Atom utf8_string_atom;
 Atom targets_atom;
 char *clipboard_text = NULL;
 Atom paste_property_atom;
+/* Build the prompt for the currently active tab. */
+void build_prompt(const Tab *tab, char *prompt, size_t size)
+{
+    if (tab->history_search_active) {
+        snprintf(prompt, size, "Enter search term:");
+    }
+    else if (tab->continuing) {
+        snprintf(prompt, size, ">");
+    }
+    else {
+        const char *username = getenv("USER");
+        const char *home = getenv("HOME");
+        const char *cwd = tab->cwd;
+
+        if (username == NULL) {
+            username = "user";
+        }
+
+        if (cwd == NULL) {
+            cwd = "";
+        }
+
+        char display_cwd[4096];
+
+        if (home != NULL &&
+            strncmp(cwd, home, strlen(home)) == 0 &&
+            (cwd[strlen(home)] == '/' || cwd[strlen(home)] == '\0')) {
+
+            snprintf(display_cwd, sizeof(display_cwd),
+                     "~%s", cwd + strlen(home));
+        }
+        else {
+            snprintf(display_cwd, sizeof(display_cwd),
+                     "%.4000s", cwd);
+        }
+
+        snprintf(prompt, size, "%.64s@terminator:%.4000s$",
+                 username, display_cwd);
+    }
+}
+
+/* Calculate where command input begins after the prompt. */
+int calculate_input_x(Display *display, GC gc, const Tab *tab)
+{
+    char prompt[4096];
+    build_prompt(tab, prompt, sizeof(prompt));
+
+    int input_x = 10;
+
+    XFontStruct *font =
+        XQueryFont(display, XGContextFromGC(gc));
+
+    if (font != NULL) {
+        input_x += XTextWidth(font, prompt, (int)strlen(prompt)) + 8;
+        XFreeFontInfo(NULL, font, 1);
+    }
+    else {
+        input_x += 120;
+    }
+
+    return input_x;
+}
 
 
 #define MAX_JOBS 100
@@ -987,30 +1049,18 @@ void draw_input(Display *display, Window window, GC gc,
     XGetGCValues(display, gc, GCForeground, &gc_values);
     unsigned long normal_color = gc_values.foreground;
 
-    const char *prompt;
+    char prompt[4096];
+    build_prompt(&tabs[active_tab], prompt, sizeof(prompt));
 
-    if (tabs[active_tab].history_search_active) {
-        prompt = "Enter search term:";
-    }
-    else {
-        prompt = tabs[active_tab].continuing
-                ? ">"
-                : "Terminator>";
-    }
     XSetForeground(display, gc,
-                   BlackPixel(display, DefaultScreen(display)));
+                BlackPixel(display, DefaultScreen(display)));
 
     XDrawString(display, window, gc,
                 10, PROMPT_Y, prompt, (int)strlen(prompt));
 
-    int input_x;
-
-    if (tabs[active_tab].history_search_active) {
-        input_x = 160;
-    }
-    else {
-        input_x = tabs[active_tab].continuing ? 25 : 120;
-    }
+    int input_x = calculate_input_x(
+        display, gc, &tabs[active_tab]
+    );
 
     int start = selection_start;
     int end = selection_end;
@@ -2304,18 +2354,32 @@ int main(int argc, char *argv[])
                     update_foreground_output(&tabs[i]);
                 }
             }
+            /* Check whether the screen needs to be redrawn. */
+            int redraw_needed = 0;
+
             /* Collect completed commands from tab workers. */
             for (int i = 0; i < tab_count; i++) {
-                collect_worker_result(&tabs[i]);
+                if (collect_worker_result(&tabs[i])) {
+                    redraw_needed = 1;
+                }
             }
 
-            /* Update multiWatch even when no keyboard event arrives. */
+            /* Update multiWatch when active. */
             if (multiwatch_session.running) {
                 multiwatch_update(&tabs[active_tab]);
+                redraw_needed = 1;
             }
 
-            /* If no X11 event is waiting, redraw and poll again. */
-            if (XPending(display) == 0) {
+            /* Foreground commands may have changed their status. */
+            for (int i = 0; i < tab_count; i++) {
+                if (tabs[i].foreground.active) {
+                    update_foreground_output(&tabs[i]);
+                    redraw_needed = 1;
+                }
+            }
+
+            /* Redraw only if something changed and no X11 event is waiting. */
+            if (redraw_needed && XPending(display) == 0) {
                 tab = &tabs[active_tab];
 
                 draw_input(
@@ -2520,7 +2584,7 @@ int main(int argc, char *argv[])
                     click_y <= PROMPT_Y + 5) {
                 tab = &tabs[active_tab];
 
-                int input_x = tab->continuing ? 25 : 120;
+                int input_x = calculate_input_x(display, gc, tab);
 
                 selection_start = input_position_from_x(
                     display, gc, tab->input, tab->length,
@@ -2544,8 +2608,7 @@ int main(int argc, char *argv[])
         else if (event.type == MotionNotify && selecting_text) {
             tab = &tabs[active_tab];
 
-            int input_x = tab->continuing ? 25 : 120;
-
+            int input_x = calculate_input_x(display, gc, tab);
             selection_end = input_position_from_x(
                 display, gc, tab->input, tab->length,
                 input_x, event.xmotion.x
@@ -2561,7 +2624,7 @@ int main(int argc, char *argv[])
                 selecting_text) {
             tab = &tabs[active_tab];
 
-            int input_x = tab->continuing ? 25 : 120;
+            int input_x = calculate_input_x(display, gc, tab);
 
             selection_end = input_position_from_x(
                 display, gc, tab->input, tab->length,
@@ -3189,10 +3252,16 @@ int main(int argc, char *argv[])
                 }
 
                 if (tab->length == 0) {
+                    char prompt[4096];
+                    build_prompt(tab, prompt, sizeof(prompt));
+
+                    char prompt_line[4100];
+                    snprintf(prompt_line, sizeof(prompt_line), "%s\n", prompt);
+
                     append_output(&tab->output,
-                                  &tab->output_capacity,
-                                  &tab->output_length,
-                                  "Terminator>\n");
+                                &tab->output_capacity,
+                                &tab->output_length,
+                                prompt_line);
 
                     tab->scroll_offset = 0;
                 }
@@ -3257,12 +3326,14 @@ int main(int argc, char *argv[])
                             history_add(tab->input);
                             tab->history_position = history_count;
                             
-                            char multiwatch_command_line[INPUT_SIZE + 20];
-                            
+                            char prompt[4096];
+                            build_prompt(tab, prompt, sizeof(prompt));
+
+                            char multiwatch_command_line[INPUT_SIZE + 4200];
+
                             snprintf(multiwatch_command_line,
-                                     sizeof(multiwatch_command_line),
-                                     "Terminator> %s\n", tab->input);
-                            
+                                    sizeof(multiwatch_command_line),
+                                    "%s %s\n", prompt, tab->input);
                             append_output(&tab->output,
                                           &tab->output_capacity,
                                           &tab->output_length,
@@ -3361,10 +3432,13 @@ int main(int argc, char *argv[])
                     history_add(tab->input);
                     tab->history_position = history_count;
 
-                    char command_line[INPUT_SIZE + 20];
+                    char prompt[4096];
+                    build_prompt(tab, prompt, sizeof(prompt));
+
+                    char command_line[INPUT_SIZE + 4200];
 
                     snprintf(command_line, sizeof(command_line),
-                             "Terminator> %s\n", tab->input);
+                            "%s %s\n", prompt, tab->input);
 
                     if (append_output(&tab->output,
                                       &tab->output_capacity,
